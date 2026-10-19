@@ -1,0 +1,14 @@
+@lam/keyring
+
+Copyright 2026 Thallium Solutions di Busconi Alessandro.
+
+This product includes software developed by Thallium Solutions di Busconi
+Alessandro.
+
+@lam/keyring is a Lammergeier third-party library for sealing secrets at rest
+(AES-256-GCM key rings, key rotation and envelope keys). It uses only the Go
+standard library cryptography packages, distributed under the BSD-style
+license of The Go Authors.
+
+The sealed-value format is compatible with the SecretBox of the
+managed-file-transfer application, from which this library was extracted.

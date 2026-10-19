@@ -1,0 +1,131 @@
+# Test: @lam/keyring — purpose-scoped subkeys and envelope (wrapped) keys.
+#
+# expect: purpose ring: KeyRing(primary=k2, ids=[k2 k1], purpose=totp)
+# expect: purpose round trip: JBSWY3DPEHPK3PXP
+# expect: same format: true
+# expect: other purpose: Corrupted
+# expect: root ring: Corrupted
+# expect: root value in purpose: Corrupted
+# expect: deterministic: true
+# expect: nested: a/b Corrupted true
+# expect: python purpose fixture: purpose-totp
+# expect: purpose with aad: ok WrongAssociatedData
+# expect: purpose older key: true
+# expect: purpose toSpec: InvalidKey
+# expect: purpose add: InvalidKey
+# expect: purpose merge mismatch: InvalidKey
+# expect: purpose of rotated ring opens: true
+# expect: empty purpose: ValueError
+# expect: wrap: true true
+# expect: unwrap: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+# expect: wrap normalises: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+# expect: wrap invalid: InvalidKey InvalidKey
+# expect: unwrap non-key: Corrupted the wrapped value is not a 32-byte data key
+# expect: wrap with aad: true WrongAssociatedData
+# expect: newWrappedKey: 64 true true
+# expect: WrappedKey str hides key: true
+# expect: unwrapRing: KeyRing(primary=tenant-7, ids=[tenant-7]) tenant data
+# expect: data key isolation: Corrupted
+# expect: rewrap after rotation: v3:k3: true
+# expect: retired key: KeyNotFound
+
+from @lam/keyring import KeyRing, WrappedKey
+from lamerrors import Result
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+const K3: str = "3333333333333333333333333333333333333333333333333333333333333333"
+const NS_KEY: str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+# Independent Python implementation: AES-256-GCM with
+# HKDF-SHA256(key=22..22, salt=none, info="lam-keyring/v1/purpose/totp"),
+# nonce 000102...0b, plaintext "purpose-totp".
+const PY_PURPOSE: str = "v2:k2:AAECAwQFBgcICQoLqLe+y/ZquULPA+NFayNonqCb9p/p5UBqb8Tk6Q=="
+
+func kind(r: Result[str]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func ringKind(r: Result[KeyRing]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+# try/catch lives in a helper: lamc 2.1.1 cannot compile a try/catch
+# inside a ``do { } catch`` block.
+func emptyPurpose(root: KeyRing) -> str {
+    try {
+        _ = root.forPurpose("")
+    } catch ValueError as _e {
+        return "ValueError"
+    }
+    return "none"
+}
+
+func main() {
+    do {
+        root: KeyRing = KeyRing.parse(f"k2={K2};k1={K1}")?
+        totp: KeyRing = root.forPurpose("totp")
+        sso: KeyRing = root.forPurpose("sso")
+        print(f"purpose ring: {totp}")
+        sealed: str = totp.seal("JBSWY3DPEHPK3PXP")?
+        print(f"purpose round trip: {totp.open(sealed)?}")
+        print(f"same format: {sealed.startsWith('v2:k2:')}")
+        print(f"other purpose: {kind(sso.open(sealed))}")
+        print(f"root ring: {kind(root.open(sealed))}")
+        print(f"root value in purpose: {kind(totp.open(root.seal('x')?))}")
+        again: KeyRing = KeyRing.parse(f"k2={K2}")?
+        print(f"deterministic: {again.forPurpose('totp').open(sealed)? == 'JBSWY3DPEHPK3PXP'}")
+        nested: KeyRing = root.forPurpose("a").forPurpose("b")
+        nestedSealed: str = nested.seal("n")?
+        print(f"nested: {nested.purpose()} {kind(root.forPurpose('a').open(nestedSealed))} {root.forPurpose('a').forPurpose('b').open(nestedSealed)? == 'n'}")
+        print(f"python purpose fixture: {totp.open(PY_PURPOSE)?}")
+
+        bound: str = totp.seal("s", "accounts:1")?
+        print(f"purpose with aad: {kind(totp.open(bound, 'accounts:1'))} {kind(totp.open(bound, 'accounts:2'))}")
+        older: str = (root.withPrimary("k1")?).forPurpose("totp").seal("old")?
+        print(f"purpose older key: {older.startsWith('v2:k1:') and totp.open(older)? == 'old'}")
+        spec: Result[str] = totp.toSpec()
+        print(f"purpose toSpec: {spec.error.kind}")
+        print(f"purpose add: {ringKind(totp.add('k3', K3))}")
+        print(f"purpose merge mismatch: {ringKind(totp.merge(sso))}")
+        rotatedRoot: KeyRing = (root.add("k3", K3)?).withPrimary("k3")?
+        print(f"purpose of rotated ring opens: {rotatedRoot.forPurpose('totp').open(sealed)? == 'JBSWY3DPEHPK3PXP'}")
+        print(f"empty purpose: {emptyPurpose(root)}")
+
+        # Envelope encryption: the ring wraps per-tenant/per-file data keys.
+        wrapped: str = root.wrapKey(NS_KEY)?
+        print(f"wrap: {wrapped.startsWith('v2:k2:')} {not wrapped.contains(NS_KEY)}")
+        print(f"unwrap: {root.unwrapKey(wrapped)?}")
+        print(f"wrap normalises: {root.unwrapKey(root.wrapKey('  ' + NS_KEY.toUpper() + ' ')?)?}")
+        print(f"wrap invalid: {kind(root.wrapKey('abcd'))} {kind(root.wrapKey('zz' * 32))}")
+        notKey: Result[str] = root.unwrapKey(root.seal("hello")?)
+        print(f"unwrap non-key: {notKey.error.kind} {notKey.error.message}")
+        tenantWrapped: str = root.wrapKey(NS_KEY, "namespaces:ns-1")?
+        print(f"wrap with aad: {root.unwrapKey(tenantWrapped, 'namespaces:ns-1')? == NS_KEY} {kind(root.unwrapKey(tenantWrapped, 'namespaces:ns-2'))}")
+
+        fresh: WrappedKey = root.newWrappedKey("tenants:7")?
+        print(f"newWrappedKey: {len(fresh.key)} {fresh.key != NS_KEY} {root.unwrapKey(fresh.wrapped, 'tenants:7')? == fresh.key}")
+        print(f"WrappedKey str hides key: {not str(fresh).contains(fresh.key)}")
+        tenantRing: KeyRing = root.unwrapRing(fresh.wrapped, "tenant-7", "tenants:7")?
+        tenantValue: str = tenantRing.seal("tenant data")?
+        print(f"unwrapRing: {tenantRing} {tenantRing.open(tenantValue)?}")
+        another: WrappedKey = root.newWrappedKey()?
+        otherTenant: KeyRing = root.unwrapRing(another.wrapped, "tenant-7")?
+        print(f"data key isolation: {kind(otherTenant.open(tenantValue))}")
+
+        # Rotating the wrapping key re-wraps the data key; data sealed with
+        # the data key is untouched.
+        rotated: KeyRing = (root.add("k3", K3)?).withPrimary("k3")?
+        rewrapped: str = rotated.reseal(fresh.wrapped, "tenants:7")?
+        print(f"rewrap after rotation: {rewrapped[:6]} {rotated.unwrapKey(rewrapped, 'tenants:7')? == fresh.key}")
+        retired: KeyRing = (rotated.without("k2")?).without("k1")?
+        print(f"retired key: {kind(retired.unwrapKey(fresh.wrapped, 'tenants:7'))}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

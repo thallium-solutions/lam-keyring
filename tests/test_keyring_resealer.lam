@@ -1,0 +1,202 @@
+# Test: @lam/keyring — Resealer: lists, items, paging with fetch/store,
+# dry runs, failures, conflicts and rebinding.
+#
+# expect: values: ResealReport(scanned=5, resealed=3, unchanged=2, failed=0, conflicts=0) batches=1
+# expect: values output: v2:k2: v2:k2: v2:k2: v2:k2: ''
+# expect: values open: a b c d
+# expect: second pass: resealed=0 unchanged=5
+# expect: failures: failed=2 resealed=1 ok=false
+# expect: failure errors: 1: Corrupted | 2: KeyNotFound
+# expect: failed kept: true
+# expect: stopOnError: KeyNotFound value 1: the value was sealed with key k9, which is not in the key ring
+# expect: dry run: resealed=2 unchanged=0 same=true
+# expect: items with aad: resealed=2 v3:k2: v3:k2:
+# expect: rebind: changed=true v3:k2: opens=secret-a
+# expect: rebind current key: changed=true
+# expect: needsWork: false true true
+# expect: run: ResealReport(scanned=7, resealed=5, unchanged=1, failed=0, conflicts=1) batches=3
+# expect: run fetch calls: 3 store calls: 6
+# expect: run table: r1=v2:k2 r2=v2:k2 r3=v2:k2 r4=v2:k2 r5=v2:k1 r6=v2:k2 r7=v2:k2
+# expect: run rows open: true
+# expect: run again: resealed=1 unchanged=6 conflicts=0
+# expect: run dry: scanned=7 resealed=1 stores=0
+# expect: run exact pages: batches=2 fetches=3
+# expect: run batch size: ValueError batchSize must be positive
+# expect: run stuck fetch: ValueError
+# expect: run fetch error: DbError connection lost
+# expect: report add: scanned=15 resealed=9 failed=2 errors=2
+
+from @lam/keyring import KeyRing, Resealer, ResealReport, SealedItem
+from lamerrors import Result, Error
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+const K9: str = "9999999999999999999999999999999999999999999999999999999999999999"
+
+#- An in-memory table ``id -> sealed`` (ids sort as strings) that records
+   calls; ``raceId`` simulates a concurrent writer changing that row. -#
+class Table {
+    func init(self) {
+        self.ids: list[str] = []
+        self.values: dict[str, str] = {}
+        self.fetches: int = 0
+        self.stores: int = 0
+        self.raceId: str = ""
+        self.failFetch: bool = False
+    }
+
+    func put(self, id: str, sealed: str) {
+        self.ids.append(id)
+        self.values[id] = sealed
+    }
+
+    func fetch(self, afterId: str, limit: int) -> Result[list[SealedItem]] {
+        self.fetches += 1
+        if self.failFetch {
+            return Result.Err(Error("DbError", "connection lost"))
+        }
+        page: list[SealedItem] = []
+        for id in self.ids {
+            if id > afterId and len(page) < limit and self.values[id] != "" {
+                page.append(SealedItem(id, self.values[id]))
+            }
+        }
+        return Result.Ok(page)
+    }
+
+    func store(self, item: SealedItem) -> Result[bool] {
+        self.stores += 1
+        if item.id == self.raceId {
+            # Someone else rewrote the row after our fetch: the CAS fails.
+            return Result.Ok(False)
+        }
+        if self.values[item.id] != item.sealed {
+            return Result.Ok(False)
+        }
+        self.values[item.id] = item.resealed
+        return Result.Ok(True)
+    }
+
+    func summary(self) -> str {
+        parts: list[str] = [f"{id}={self.values[id][:5]}" for id in self.ids]
+        return " ".join(parts)
+    }
+}
+
+func prefixes(values: list[str]) -> str {
+    shown: list[str] = []
+    for v in values {
+        shown.append(v[: 6] if v != "" else "''")
+    }
+    return " ".join(shown)
+}
+
+func main() {
+    do {
+        oldRing: KeyRing = KeyRing.parse(f"k1={K1}")?
+        legacyRing: KeyRing = KeyRing.parse(K1)?
+        ring: KeyRing = KeyRing.parse(f"k2={K2};k1={K1};{K1}")?
+        current: str = ring.seal("d")?
+        values: list[str] = [legacyRing.seal("a")?, oldRing.seal("b")?, oldRing.seal("c")?, current, ""]
+
+        resealer: Resealer = Resealer(ring)
+        report: ResealReport = resealer.values(values)?
+        print(f"values: {report} batches={report.batches}")
+        print(f"values output: {prefixes(report.values)}")
+        opened: list[str] = []
+        for v in report.values[: 4] {
+            opened.append(ring.open(v)?)
+        }
+        print(f"values open: {' '.join(opened)}")
+        second: ResealReport = resealer.values(report.values)?
+        print(f"second pass: resealed={second.resealed} unchanged={second.unchanged}")
+
+        foreign: KeyRing = KeyRing.parse(f"k9={K9}")?
+        tampered: str = oldRing.seal("t")?
+        tampered = tampered[: len(tampered) - 5] + ("B" if tampered[len(tampered) - 5: len(tampered) - 4] == "A" else "A") + tampered[len(tampered) - 4:]
+        mixed: list[str] = [oldRing.seal("ok")?, tampered, foreign.seal("x")?]
+        failed: ResealReport = resealer.values(mixed)?
+        print(f"failures: failed={failed.failed} resealed={failed.resealed} ok={failed.ok()}")
+        print(f"failure errors: {failed.errors[0].split(' ')[0]} {failed.errors[0].split(' ')[1].trimRight(':')} | {failed.errors[1].split(' ')[0]} {failed.errors[1].split(' ')[1].trimRight(':')}")
+        print(f"failed kept: {failed.values[1] == tampered and failed.values[2] == mixed[2]}")
+        strict: Result[ResealReport] = Resealer(ring, stopOnError = True).values([oldRing.seal("ok")?, foreign.seal("x")?])
+        print(f"stopOnError: {strict.error.kind} {strict.error.message}")
+
+        dry: ResealReport = Resealer(ring, dryRun = True).values([values[0], values[1]])?
+        print(f"dry run: resealed={dry.resealed} unchanged={dry.unchanged} same={dry.values[0] == values[0] and dry.values[1] == values[1]}")
+
+        items: list[SealedItem] = []
+        items.append(SealedItem("1", oldRing.seal("secret-a", "accounts:1")?, "accounts:1"))
+        items.append(SealedItem("2", oldRing.seal("secret-b", "accounts:2")?, "accounts:2"))
+        withAad: ResealReport = resealer.items(items)?
+        print(f"items with aad: resealed={withAad.resealed} {items[0].resealed[:6]} {items[1].resealed[:6]}")
+
+        unbound: SealedItem = SealedItem("1", oldRing.seal("secret-a")?).rebindTo("accounts:1")
+        _ = resealer.process(unbound)?
+        print(f"rebind: changed={unbound.changed} {unbound.resealed[:6]} opens={ring.open(unbound.resealed, 'accounts:1')?}")
+        currentItem: SealedItem = SealedItem("2", ring.seal("v")?).rebindTo("accounts:2")
+        _ = resealer.process(currentItem)?
+        print(f"rebind current key: changed={currentItem.changed}")
+        print(f"needsWork: {resealer.needsWork(SealedItem('x', current))} {resealer.needsWork(SealedItem('x', values[1]))} {resealer.needsWork(SealedItem('x', current).rebindTo('t:1'))}")
+
+        # Paging through a table with compare-and-swap writes.
+        table: Table = Table()
+        table.put("r1", legacyRing.seal("one")?)
+        table.put("r2", oldRing.seal("two")?)
+        table.put("r3", ring.seal("three")?)
+        table.put("r4", oldRing.seal("four")?)
+        table.put("r5", oldRing.seal("five")?)
+        table.put("r6", oldRing.seal("six")?)
+        table.put("r7", oldRing.seal("seven")?)
+        table.raceId = "r5"
+        fetch: func(str, int) -> Result[list[SealedItem]] = lambda(afterId: str, limit: int) -> Result[list[SealedItem]]: table.fetch(afterId, limit)
+        store: func(SealedItem) -> Result[bool] = lambda(item: SealedItem) -> Result[bool]: table.store(item)
+        run: ResealReport = resealer.run(fetch, store, 3)?
+        print(f"run: {run} batches={run.batches}")
+        print(f"run fetch calls: {table.fetches} store calls: {table.stores}")
+        print(f"run table: {table.summary()}")
+        plain: list[str] = []
+        for id in table.ids {
+            plain.append(ring.open(table.values[id])?)
+        }
+        print(f"run rows open: {','.join(plain) == 'one,two,three,four,five,six,seven'}")
+        table.raceId = ""
+        again: ResealReport = resealer.run(fetch, store, 3)?
+        print(f"run again: resealed={again.resealed} unchanged={again.unchanged} conflicts={again.conflicts}")
+
+        table.stores = 0
+        table.values["r1"] = oldRing.seal("one")?
+        dryRun: ResealReport = Resealer(ring, dryRun = True).run(fetch, store, 3)?
+        print(f"run dry: scanned={dryRun.scanned} resealed={dryRun.resealed} stores={table.stores}")
+
+        exact: Table = Table()
+        for i in range(1, 5) {
+            exact.put(f"e{i}", ring.seal(str(i))?)
+        }
+        exactFetch: func(str, int) -> Result[list[SealedItem]] = lambda(afterId: str, limit: int) -> Result[list[SealedItem]]: exact.fetch(afterId, limit)
+        exactStore: func(SealedItem) -> Result[bool] = lambda(item: SealedItem) -> Result[bool]: exact.store(item)
+        exactReport: ResealReport = resealer.run(exactFetch, exactStore, 2)?
+        print(f"run exact pages: batches={exactReport.batches} fetches={exact.fetches}")
+
+        badSize: Result[ResealReport] = resealer.run(fetch, store, 0)
+        print(f"run batch size: {badSize.error.kind} {badSize.error.message}")
+        # A typed local: a list literal inside Result.Ok in a lambda loses
+        # its element type with lamc 2.1.1.
+        stuckPage: list[SealedItem] = [SealedItem("", current)]
+        stuckFetch: func(str, int) -> Result[list[SealedItem]] = lambda(afterId: str, limit: int) -> Result[list[SealedItem]]: Result.Ok(stuckPage)
+        stuck: Result[ResealReport] = resealer.run(stuckFetch, store, 1)
+        print(f"run stuck fetch: {stuck.error.kind}")
+        table.failFetch = True
+        broken: Result[ResealReport] = resealer.run(fetch, store, 3)
+        print(f"run fetch error: {broken.error.kind} {broken.error.message}")
+
+        total: ResealReport = ResealReport()
+        total.add(report)
+        total.add(failed)
+        total.add(run)
+        total.add(ResealReport())
+        print(f"report add: scanned={total.scanned} resealed={total.resealed} failed={total.failed} errors={len(total.errors)}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

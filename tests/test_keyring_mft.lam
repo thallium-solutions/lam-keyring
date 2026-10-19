@@ -1,0 +1,120 @@
+# Test: @lam/keyring — byte compatibility with the managed-file-transfer
+# (MFT) SecretBox. The fixtures were sealed by MFT's own code
+# (lib/mft/security.lam at commit 02d8f3a, see tests/interop/).
+#
+# expect: keyFrom: eb260a9a1c5185f49ac7134f992190a9317cda324f8d067a8d1a2ee57314b15f
+# expect: single hex key opens legacy: totp-secret
+# expect: ring opens legacy: totp-secret
+# expect: ring opens v2: sso-secret
+# expect: utf8 v2: pässwörd ✓
+# expect: empty v2: ''
+# expect: JWT_SECRET only opens legacy: JBSWY3DPEHPK3PXP
+# expect: DATA_ENCRYPTION_KEYS + JWT_SECRET opens legacy: JBSWY3DPEHPK3PXP
+# expect: namespace key unwraps: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+# expect: inspect: legacy/ v2/k2
+# expect: needsReseal legacy-only ring: false false
+# expect: needsReseal ring: true false
+# expect: needsReseal after rotation: true true
+# expect: wrong key id: KeyNotFound
+# expect: wrong JWT_SECRET: Corrupted
+# expect: MFT-style ring spec: KeyRing(primary=k2, ids=[k2 legacy])
+# expect: legacy layout: true true
+# expect: v2 layout: true true
+# expect: reseal legacy to v2: true JBSWY3DPEHPK3PXP
+# expect: reseal current unchanged: true
+
+from @lam/keyring import KeyRing, KeyDerivation, SealedInfo
+from lamerrors import Result
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+const K3: str = "3333333333333333333333333333333333333333333333333333333333333333"
+const NS_KEY: str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+const JWT_SECRET: str = "a-long-application-secret-0123456789"
+const LABEL: str = "mft:secret-box:v1"
+
+# SecretBox.seal(K1, "totp-secret")
+const LEGACY_K1: str = "oYdQBDPQuDjjUBcne3AGWuH9EfHDUMY0YmAZHtBzvGi3KJbtwSrm"
+# SecretBox.seal(SecretBox.keyFrom(JWT_SECRET), "JBSWY3DPEHPK3PXP")
+const LEGACY_DERIVED: str = "Fv5i5nsOxagzK/SlbRsLnhe0eUQR66x8+HVY2HLyX/8NNKh2etIpP5wERLg="
+# SecretBox.seal("ring:k2=<K2>;legacy=<K1>", "sso-secret")
+const V2_K2: str = "v2:k2:p7PbUp7Fc7Tc5K46TJ7qQXZ05ycec3k9c/u7AyxxFo3+qA0XGiA="
+# SecretBox.seal("ring:k2=<K2>;legacy=<keyFrom(JWT_SECRET)>", NS_KEY): a namespace data key
+const V2_NS: str = "v2:k2:etNJ+sPjXWa+EMo+LOCHLqLyTMdT71otdjmUE6DH7weyZ2lMnDkvb5EiKn1ybtvlvhltgnkoby7NS8KLYVzlnRatCibA5j3evh3onjK0pURB0rC3hxpS3HxG5ZU="
+# SecretBox.seal("ring:k2=<K2>", "")
+const V2_EMPTY: str = "v2:k2:XHQwz/YXglhnXSa3hv+3eiFeufYUNU3jimi3hQ=="
+# SecretBox.seal("ring:k2=<K2>", "pässwörd ✓")
+const V2_UTF8: str = "v2:k2:k/Aoo/W5n9NRKqL/cycwFZdNMHE+JOs234P+pMmuISKo6/WGTlvehH2H"
+
+func kind(r: Result[str]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func describe(info: SealedInfo) -> str {
+    return f"{info.version}/{info.keyId}"
+}
+
+#- Decoded byte length of a base64 payload (padding aware). -#
+func rawLength(data: str) -> int {
+    padding: int = 0
+    if data.endsWith("==") {
+        padding = 2
+    } elif data.endsWith("=") {
+        padding = 1
+    }
+    return len(data) // 4 * 3 - padding
+}
+
+func main() {
+    do {
+        print(f"keyFrom: {KeyDerivation.legacyHmac(JWT_SECRET, LABEL)}")
+
+        # MFT SecretBox.open(K1, ...) and SecretBox.open("ring:...", ...)
+        single: KeyRing = KeyRing.parse(K1)?
+        print(f"single hex key opens legacy: {single.open(LEGACY_K1)?}")
+        ring: KeyRing = KeyRing.parse(f"ring:k2={K2};legacy={K1}")?
+        print(f"ring opens legacy: {ring.open(LEGACY_K1)?}")
+        print(f"ring opens v2: {ring.open(V2_K2)?}")
+        print(f"utf8 v2: {ring.open(V2_UTF8)?}")
+        print(f"empty v2: '{ring.open(V2_EMPTY)?}'")
+
+        # AppConfig.secretBoxKey(): JWT_SECRET alone, then with DATA_ENCRYPTION_KEYS.
+        jwtOnly: KeyRing = KeyRing.withFallback("", JWT_SECRET, LABEL)?
+        print(f"JWT_SECRET only opens legacy: {jwtOnly.open(LEGACY_DERIVED)?}")
+        configured: KeyRing = KeyRing.withFallback(f"k2:{K2}", JWT_SECRET, LABEL)?
+        print(f"DATA_ENCRYPTION_KEYS + JWT_SECRET opens legacy: {configured.open(LEGACY_DERIVED)?}")
+        print(f"namespace key unwraps: {configured.unwrapKey(V2_NS)?}")
+        print(f"inspect: {describe(KeyRing.inspect(LEGACY_DERIVED)?)} {describe(KeyRing.inspect(V2_NS)?)}")
+
+        # SecretBox.needsReseal parity.
+        print(f"needsReseal legacy-only ring: {jwtOnly.needsReseal(LEGACY_DERIVED)} {jwtOnly.needsReseal(V2_K2)}")
+        print(f"needsReseal ring: {configured.needsReseal(LEGACY_DERIVED)} {configured.needsReseal(V2_NS)}")
+        rotated: KeyRing = KeyRing.withFallback(f"k3:{K3},k2:{K2}", JWT_SECRET, LABEL)?
+        print(f"needsReseal after rotation: {rotated.needsReseal(V2_NS)} {rotated.needsReseal(LEGACY_DERIVED)}")
+
+        noK2: KeyRing = KeyRing.parse(f"k9={K2}")?
+        print(f"wrong key id: {kind(noK2.open(V2_K2))}")
+        otherSecret: KeyRing = KeyRing.withFallback("", "another-secret", LABEL)?
+        print(f"wrong JWT_SECRET: {kind(otherSecret.open(LEGACY_DERIVED))}")
+
+        # The ring MFT builds as a string: "ring:k2=<hex>;legacy=<derived>".
+        mftSpec: str = f"ring:k2={K2};legacy={KeyDerivation.legacyHmac(JWT_SECRET, LABEL)}"
+        print(f"MFT-style ring spec: {KeyRing.parse(mftSpec)?}")
+
+        # Values written by the library have MFT's exact layout:
+        # base64(12-byte nonce || ciphertext || 16-byte tag).
+        newLegacy: str = jwtOnly.seal("JBSWY3DPEHPK3PXP")?
+        print(f"legacy layout: {not newLegacy.contains(':')} {rawLength(newLegacy) == 12 + 16 + 16}")
+        newV2: str = configured.seal("sso-secret")?
+        print(f"v2 layout: {newV2.startsWith('v2:k2:')} {rawLength(newV2[6:]) == 12 + 10 + 16}")
+
+        resealed: str = configured.reseal(LEGACY_DERIVED)?
+        print(f"reseal legacy to v2: {resealed.startsWith('v2:k2:')} {configured.open(resealed)?}")
+        print(f"reseal current unchanged: {configured.reseal(V2_NS)? == V2_NS}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

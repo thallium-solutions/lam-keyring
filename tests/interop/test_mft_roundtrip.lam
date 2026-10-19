@@ -1,0 +1,39 @@
+# Interop test: values sealed by @lam/keyring open with the
+# managed-file-transfer (MFT) SecretBox and the other way round. Runs only
+# with an MFT checkout: python3 tests/run_lamkeyring_tests.py --mft <dir>
+#
+# expect: v2:k2: mft opens lib v2: from-lib
+# expect: mft opens lib wrapped key: true
+# expect: mft opens lib legacy: legacy-from-lib legacy-from-lib
+# expect: lib opens mft: from-mft needsReseal lib=false mft=false
+# expect: lib opens mft legacy: legacy-mft needsReseal lib=true mft=true
+# expect: same derivation: true
+# expect: mft opens resealed: legacy-mft true
+
+from mft.security import SecretBox
+from @lam/keyring import KeyRing
+
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+const NS: str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+const LABEL: str = "mft:secret-box:v1"
+
+func main() {
+    secret: str = "a-long-application-secret-0123456789"
+    # AppConfig.secretBoxKey() with DATA_ENCRYPTION_KEYS=k2:<K2>
+    mftKey: str = f"ring:k2={K2};legacy={SecretBox.keyFrom(secret)}"
+    ring: KeyRing = KeyRing.withFallback(f"k2:{K2}", secret, LABEL).unwrap()
+    a: str = ring.seal("from-lib").unwrap()
+    print(f"{a[:6]} mft opens lib v2: {SecretBox.open(mftKey, a).unwrap()}")
+    w: str = ring.wrapKey(NS).unwrap()
+    print(f"mft opens lib wrapped key: {SecretBox.open(mftKey, w).unwrap() == NS}")
+    legacyRing: KeyRing = KeyRing.withFallback("", secret, LABEL).unwrap()
+    l: str = legacyRing.seal("legacy-from-lib").unwrap()
+    print(f"mft opens lib legacy: {SecretBox.open(SecretBox.keyFrom(secret), l).unwrap()} {SecretBox.open(mftKey, l).unwrap()}")
+    m: str = SecretBox.seal(mftKey, "from-mft").unwrap()
+    print(f"lib opens mft: {ring.open(m).unwrap()} needsReseal lib={ring.needsReseal(m)} mft={SecretBox.needsReseal(mftKey, m)}")
+    lm: str = SecretBox.seal(SecretBox.keyFrom(secret), "legacy-mft").unwrap()
+    print(f"lib opens mft legacy: {ring.open(lm).unwrap()} needsReseal lib={ring.needsReseal(lm)} mft={SecretBox.needsReseal(mftKey, lm)}")
+    print(f"same derivation: {legacyRing.toSpec().unwrap() == SecretBox.keyFrom(secret)}")
+    resealed: str = ring.reseal(lm).unwrap()
+    print(f"mft opens resealed: {SecretBox.open(mftKey, resealed).unwrap()} {not SecretBox.needsReseal(mftKey, resealed)}")
+}

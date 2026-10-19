@@ -1,0 +1,108 @@
+# Test: @lam/keyring — parsing key rings, primary selection, ring changes.
+#
+# expect: parsed: KeyRing(primary=k2, ids=[k2 k1])
+# expect: primary k2 size 2 has k1 true has k9 false
+# expect: explicit primary: k1
+# expect: unknown primary: KeyNotFound
+# expect: ring prefix: KeyRing(primary=a, ids=[a b])
+# expect: env style: KeyRing(primary=new, ids=[new old])
+# expect: whitespace and case: KeyRing(primary=x, ids=[x y])
+# expect: bare key: KeyRing(primary=(unlabelled), ids=[(unlabelled)])
+# expect: mixed: KeyRing(primary=k2, ids=[k2 (unlabelled)])
+# expect: empty: InvalidKey the key ring is empty
+# expect: short key: InvalidKey key k1 must be 32 bytes written as 64 hex characters (openssl rand -hex 32)
+# expect: not hex: InvalidKey
+# expect: duplicate: InvalidKey duplicate key id k1
+# expect: two unlabelled: InvalidKey only one key may be unlabelled
+# expect: bad id: InvalidKey
+# expect: str hides keys: true
+# expect: spec round trip: true
+# expect: spec primary first: k1=1111
+# expect: add: KeyRing(primary=k2, ids=[k2 k1 k0])
+# expect: add duplicate: InvalidKey
+# expect: merge: KeyRing(primary=k2, ids=[k2 k1 m])
+# expect: withPrimary: KeyRing(primary=k1, ids=[k2 k1])
+# expect: without: KeyRing(primary=k2, ids=[k2])
+# expect: without primary: InvalidKey
+# expect: without unknown: KeyNotFound
+# expect: original unchanged: KeyRing(primary=k2, ids=[k2 k1])
+# expect: fromEnv: KeyRing(primary=b, ids=[a b])
+# expect: fromEnv missing: InvalidKey environment variable LAM_KEYRING_TEST_MISSING is not set
+# expect: fromEnv invalid: InvalidKey LAM_KEYRING_TEST_BAD: the key ring is empty
+# expect: generated: 64 true true
+# expect: single: KeyRing(primary=solo, ids=[solo])
+
+from @lam/keyring import KeyRing
+from lamerrors import Result
+from lamenv import Env
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+
+func kind(r: Result[KeyRing]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func main() {
+    do {
+        ring: KeyRing = KeyRing.parse(f"k2={K2};k1={K1}")?
+        print(f"parsed: {ring}")
+        print(f"primary {ring.primaryId()} size {ring.size()} has k1 {ring.has('k1')} has k9 {ring.has('k9')}")
+        chosen: KeyRing = KeyRing.parse(f"k2={K2};k1={K1}", "k1")?
+        print(f"explicit primary: {chosen.primaryId()}")
+        print(f"unknown primary: {kind(KeyRing.parse(f'k2={K2}', 'k7'))}")
+        print(f"ring prefix: {KeyRing.parse(f'ring:a={K1};b={K2}')?}")
+        print(f"env style: {KeyRing.parse(f'new:{K2}, old:{K1}')?}")
+        upper: str = K2.toUpper()
+        print(f"whitespace and case: {KeyRing.parse(f'  x = {K1} ;; y={upper} ;')?}")
+        print(f"bare key: {KeyRing.parse(K1)?}")
+        print(f"mixed: {KeyRing.parse(f'k2={K2};{K1}')?}")
+
+        empty: Result[KeyRing] = KeyRing.parse(" ; ")
+        print(f"empty: {empty.error.kind} {empty.error.message}")
+        short: Result[KeyRing] = KeyRing.parse("k1=abcd")
+        print(f"short key: {short.error.kind} {short.error.message}")
+        print(f"not hex: {kind(KeyRing.parse('k1=' + 'zz' * 32))}")
+        dup: Result[KeyRing] = KeyRing.parse(f"k1={K1};k1={K2}")
+        print(f"duplicate: {dup.error.kind} {dup.error.message}")
+        two: Result[KeyRing] = KeyRing.parse(f"{K1};{K2}")
+        print(f"two unlabelled: {two.error.kind} {two.error.message}")
+        print(f"bad id: {kind(KeyRing.parse(f'my key={K1}'))}")
+
+        shown: str = str(ring)
+        print(f"str hides keys: {not shown.contains('1111') and not shown.contains('2222')}")
+        spec: str = ring.toSpec()?
+        again: KeyRing = KeyRing.parse(spec)?
+        print(f"spec round trip: {again.toSpec()? == spec}")
+        print(f"spec primary first: {chosen.toSpec()?[:7]}")
+
+        added: KeyRing = ring.add("k0", "00" * 32)?
+        print(f"add: {added}")
+        print(f"add duplicate: {kind(ring.add('k1', K2))}")
+        other: KeyRing = KeyRing.single("m", "ab" * 32)?
+        print(f"merge: {ring.merge(other)?}")
+        print(f"withPrimary: {ring.withPrimary('k1')?}")
+        print(f"without: {ring.without('k1')?}")
+        print(f"without primary: {kind(ring.without('k2'))}")
+        print(f"without unknown: {kind(ring.without('k9'))}")
+        print(f"original unchanged: {ring}")
+
+        _ = Env.set("LAM_KEYRING_TEST_KEYS", f"a:{K1},b:{K2}")
+        print(f"fromEnv: {KeyRing.fromEnv('LAM_KEYRING_TEST_KEYS', 'b')?}")
+        missing: Result[KeyRing] = KeyRing.fromEnv("LAM_KEYRING_TEST_MISSING")
+        print(f"fromEnv missing: {missing.error.kind} {missing.error.message}")
+        _ = Env.set("LAM_KEYRING_TEST_BAD", ";")
+        bad: Result[KeyRing] = KeyRing.fromEnv("LAM_KEYRING_TEST_BAD")
+        print(f"fromEnv invalid: {bad.error.kind} {bad.error.message}")
+
+        g1: str = KeyRing.generateKey()
+        g2: str = KeyRing.generateKey()
+        print(f"generated: {len(g1)} {g1 != g2} {KeyRing.single('g', g1).ok()}")
+        print(f"single: {KeyRing.single('solo', K1)?}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

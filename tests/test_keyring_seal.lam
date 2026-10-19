@@ -1,0 +1,116 @@
+# Test: @lam/keyring — sealing, opening, formats, tampering and errors.
+#
+# expect: v2 prefix: true
+# expect: hides plaintext: true
+# expect: random nonce: true
+# expect: round trip: hunter2
+# expect: older key opens: true
+# expect: empty plaintext: '' v2:k2:
+# expect: utf8 round trip: pässwörd ✓
+# expect: binary round trip: true
+# expect: long round trip: 100000
+# expect: unknown key id: KeyNotFound the value was sealed with key k2, which is not in the key ring
+# expect: wrong key under right id: Corrupted
+# expect: tampered tag: Corrupted
+# expect: tampered nonce: Corrupted
+# expect: truncated: Corrupted
+# expect: not base64: Corrupted sealed value is malformed
+# expect: non-canonical base64: Corrupted
+# expect: empty value: Corrupted
+# expect: unknown version: Corrupted
+# expect: extra colon: Corrupted
+# expect: missing id: Corrupted
+# expect: legacy primary seals unprefixed: true
+# expect: legacy round trip: totp-secret
+# expect: legacy opened by labelled ring: totp-secret
+# expect: legacy not opened by other keys: Corrupted
+# expect: legacy tampered: Corrupted
+# expect: legacy primary refuses aad: InvalidKey
+# expect: inspect v2: SealedInfo(version=v2, keyId=k2, boundToAad=false)
+# expect: inspect legacy: SealedInfo(version=legacy, keyId=, boundToAad=false)
+# expect: inspect bad: Corrupted
+# expect: constant time: true false false true
+
+from @lam/keyring import KeyRing, SealedInfo
+from lamerrors import Result
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+const K3: str = "3333333333333333333333333333333333333333333333333333333333333333"
+
+func describe(r: Result[str]) -> str {
+    if r.ok() {
+        return "ok: " + r.unwrap()
+    }
+    return r.error.kind
+}
+
+#- Changes one base64 character inside the GCM tag (a fully significant
+   position, before any padding bits). -#
+func flipTag(sealed: str) -> str {
+    at: int = len(sealed) - 5
+    ch: str = sealed[at: at + 1]
+    replacement: str = "B" if ch == "A" else "A"
+    return sealed[: at] + replacement + sealed[at + 1:]
+}
+
+func main() {
+    do {
+        ring: KeyRing = KeyRing.parse(f"k2={K2};k1={K1}")?
+        sealed: str = ring.seal("hunter2")?
+        print(f"v2 prefix: {sealed.startsWith('v2:k2:')}")
+        print(f"hides plaintext: {not sealed.contains('hunter2')}")
+        print(f"random nonce: {ring.seal('hunter2')? != sealed}")
+        print(f"round trip: {ring.open(sealed)?}")
+
+        oldRing: KeyRing = ring.withPrimary("k1")?
+        byOld: str = oldRing.seal("old")?
+        print(f"older key opens: {byOld.startsWith('v2:k1:') and ring.open(byOld)? == 'old'}")
+
+        emptySealed: str = ring.seal("")?
+        print(f"empty plaintext: '{ring.open(emptySealed)?}' {emptySealed[:6]}")
+        print(f"utf8 round trip: {ring.open(ring.seal('pässwörd ✓')?)?}")
+        binary: str = "\x00\x01\xff\xfe\n\t"
+        print(f"binary round trip: {ring.open(ring.seal(binary)?)? == binary}")
+        long: str = "x" * 100000
+        print(f"long round trip: {len(ring.open(ring.seal(long)?)?)}")
+
+        k1only: KeyRing = KeyRing.parse(f"k1={K1}")?
+        unknown: Result[str] = k1only.open(sealed)
+        print(f"unknown key id: {unknown.error.kind} {unknown.error.message}")
+        wrongMaterial: KeyRing = KeyRing.parse(f"k2={K3}")?
+        print(f"wrong key under right id: {describe(wrongMaterial.open(sealed))}")
+        print(f"tampered tag: {describe(ring.open(flipTag(sealed)))}")
+        body: str = sealed[6:]
+        nonceFlip: str = ("B" if body[: 1] == "A" else "A") + body[1:]
+        print(f"tampered nonce: {describe(ring.open('v2:k2:' + nonceFlip))}")
+        print(f"truncated: {describe(ring.open(sealed[:20]))}")
+        garbage: Result[str] = ring.open("v2:k2:not base64!")
+        print(f"not base64: {garbage.error.kind} {garbage.error.message}")
+        print(f"non-canonical base64: {describe(ring.open(emptySealed[:len(emptySealed) - 3] + 'B=='))}")
+        print(f"empty value: {describe(ring.open(''))}")
+        print(f"unknown version: {describe(ring.open('v9:k2:' + body))}")
+        print(f"extra colon: {describe(ring.open('v2:k2:x:' + body))}")
+        print(f"missing id: {describe(ring.open('v2::' + body))}")
+
+        legacyRing: KeyRing = KeyRing.parse(K1)?
+        legacy: str = legacyRing.seal("totp-secret")?
+        print(f"legacy primary seals unprefixed: {not legacy.contains(':') and len(legacy) > 20}")
+        print(f"legacy round trip: {legacyRing.open(legacy)?}")
+        print(f"legacy opened by labelled ring: {ring.open(legacy)?}")
+        k3: KeyRing = KeyRing.parse(f"k3={K3};k2={K2}")?
+        print(f"legacy not opened by other keys: {describe(k3.open(legacy))}")
+        print(f"legacy tampered: {describe(legacyRing.open(flipTag(legacy)))}")
+        refused: Result[str] = legacyRing.seal("x", "row:1")
+        print(f"legacy primary refuses aad: {refused.error.kind}")
+
+        print(f"inspect v2: {KeyRing.inspect(sealed)?}")
+        print(f"inspect legacy: {KeyRing.inspect(legacy)?}")
+        bad: Result[SealedInfo] = KeyRing.inspect("v2:only-two")
+        print(f"inspect bad: {bad.error.kind}")
+
+        print(f"constant time: {KeyRing.constantTimeEquals('abc', 'abc')} {KeyRing.constantTimeEquals('abc', 'abd')} {KeyRing.constantTimeEquals('abc', 'abcd')} {KeyRing.constantTimeEquals('', '')}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

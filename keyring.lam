@@ -1,0 +1,851 @@
+# @lam/keyring — 1.0.0
+#
+# Sealing secrets at rest for the Lammergeier programming language:
+# AES-256-GCM with key identifiers, key rotation, associated data,
+# purpose-scoped subkeys and envelope (wrapped data) keys. Only the Go
+# standard library is used (crypto/aes, crypto/cipher, crypto/hkdf,
+# crypto/hmac, crypto/pbkdf2, crypto/rand, crypto/sha256, crypto/subtle).
+#
+# Usage::
+#
+#     from @lam/keyring import KeyRing
+#     from lamerrors import Result
+#
+#     ring: KeyRing = KeyRing.parse("k2=<64 hex>;k1=<64 hex>")?
+#     sealed: str = ring.seal("totp-secret", "accounts.mfa_secret:42")?
+#     plain: str = ring.open(sealed, "accounts.mfa_secret:42")?
+#
+# The wire format (README.md, "Format") is compatible with the values
+# written by the managed-file-transfer application's SecretBox:
+#
+#     <base64(nonce || ciphertext)>            legacy, no key id
+#     v2:<keyId>:<base64(nonce || ciphertext)> no associated data
+#     v3:<keyId>:<base64(check || nonce || ciphertext)> bound to associated data
+#
+# Rings are immutable: every method that changes a ring returns a new one,
+# so a ring can be shared between goroutines without locking.
+
+from lamerrors import Result, Error
+from lamenv import Env
+
+go! {
+    import (
+        "crypto/aes"
+        "crypto/cipher"
+        "crypto/hkdf"
+        "crypto/hmac"
+        "crypto/pbkdf2"
+        cryptorand "crypto/rand"
+        "crypto/sha256"
+        "crypto/subtle"
+        "encoding/base64"
+        "encoding/hex"
+        "errors"
+        "strconv"
+        "strings"
+    )
+
+    const keyringKeySize = 32
+    const keyringNonceSize = 12
+    const keyringTagSize = 16
+    const keyringCheckSize = 8
+    const keyringPurposeInfo = "lam-keyring/v1/purpose/"
+    const keyringCheckInfo = "lam-keyring/v1/aad-check"
+
+    // keyringAead builds AES-256-GCM (12-byte nonce, 16-byte tag) from 32
+    // raw key bytes.
+    func keyringAead(key string) (cipher.AEAD, error) {
+        if len(key) != keyringKeySize {
+            return nil, errors.New("a key must be 32 bytes")
+        }
+        block, err := aes.NewCipher([]byte(key))
+        if err != nil {
+            return nil, err
+        }
+        return cipher.NewGCM(block)
+    }
+
+    // keyringSealRaw returns nonce || ciphertext || tag.
+    func keyringSealRaw(key string, plaintext string, aad string) ([]byte, error) {
+        aead, err := keyringAead(key)
+        if err != nil {
+            return nil, err
+        }
+        nonce := make([]byte, keyringNonceSize)
+        if _, err := cryptorand.Read(nonce); err != nil {
+            return nil, err
+        }
+        var ad []byte
+        if aad != "" {
+            ad = []byte(aad)
+        }
+        return aead.Seal(nonce, nonce, []byte(plaintext), ad), nil
+    }
+
+    // keyringOpenRaw opens nonce || ciphertext || tag; ok is false when the
+    // value does not authenticate (wrong key, wrong data or tampered).
+    func keyringOpenRaw(key string, raw []byte, aad string) (string, bool) {
+        aead, err := keyringAead(key)
+        if err != nil || len(raw) < keyringNonceSize+keyringTagSize {
+            return "", false
+        }
+        var ad []byte
+        if aad != "" {
+            ad = []byte(aad)
+        }
+        plain, err := aead.Open(nil, raw[:keyringNonceSize], raw[keyringNonceSize:], ad)
+        if err != nil {
+            return "", false
+        }
+        return string(plain), true
+    }
+
+    func keyringHkdf(secret string, salt string, info string, length int) (string, error) {
+        out, err := hkdf.Key(sha256.New, []byte(secret), []byte(salt), info, length)
+        if err != nil {
+            return "", err
+        }
+        return string(out), nil
+    }
+
+    // keyringAadCheck is the 8-byte keyed fingerprint of the associated data
+    // stored in v3 values, keyed by the ring's root key (not the purpose
+    // subkey), so a wrong purpose reports Corrupted and wrong associated
+    // data reports WrongAssociatedData.
+    func keyringAadCheck(root string, aad string) string {
+        checkKey, err := hkdf.Key(sha256.New, []byte(root), nil, keyringCheckInfo, keyringKeySize)
+        if err != nil {
+            return ""
+        }
+        mac := hmac.New(sha256.New, checkKey)
+        mac.Write([]byte(aad))
+        return string(mac.Sum(nil)[:keyringCheckSize])
+    }
+
+    func keyringValidId(id string) bool {
+        if id == "" {
+            return false
+        }
+        for _, r := range id {
+            if r <= ' ' || r == 0x7f || strings.ContainsRune(":;,=", r) {
+                return false
+            }
+        }
+        return true
+    }
+
+    func keyringDecodeHexKey(text string) (string, bool) {
+        clean := strings.TrimSpace(text)
+        if len(clean) != 2*keyringKeySize {
+            return "", false
+        }
+        raw, err := hex.DecodeString(clean)
+        if err != nil {
+            return "", false
+        }
+        return string(raw), true
+    }
+
+    func keyringIsHexKey(text string) bool {
+        _, ok := keyringDecodeHexKey(text)
+        return ok
+    }
+
+    // keyringSplitSealed splits "vN:<id>:<data>"; version is "legacy" for
+    // values without a prefix and "" for malformed values.
+    func keyringSplitSealed(sealed string) (version string, id string, data string) {
+        if !strings.Contains(sealed, ":") {
+            return "legacy", "", sealed
+        }
+        parts := strings.Split(sealed, ":")
+        if len(parts) != 3 || parts[1] == "" || (parts[0] != "v2" && parts[0] != "v3") {
+            return "", "", ""
+        }
+        return parts[0], parts[1], parts[2]
+    }
+}
+
+#- What a sealed value says about itself, without opening it. -#
+class SealedInfo {
+    func init(self, version: str, keyId: str, boundToAad: bool) {
+        #- ``legacy`` (no prefix), ``v2`` or ``v3``. -#
+        self.version: str = version
+        #- The id of the key that sealed the value; empty for legacy values. -#
+        self.keyId: str = keyId
+        #- True for v3 values, which only open with their associated data. -#
+        self.boundToAad: bool = boundToAad
+    }
+
+    func __str__(self) -> str {
+        return f"SealedInfo(version={self.version}, keyId={self.keyId}, boundToAad={self.boundToAad})"
+    }
+}
+
+#- A fresh data key and its sealed (wrapped) form. Store ``wrapped``; use
+   ``key`` (64 hex characters) and forget it. -#
+class WrappedKey {
+    func init(self, key: str, wrapped: str) {
+        self.key: str = key
+        self.wrapped: str = wrapped
+    }
+
+    func __str__(self) -> str {
+        return f"WrappedKey(wrapped={self.wrapped})"
+    }
+}
+
+#- Key derivation primitives (outputs are lowercase hex). -#
+class KeyDerivation {
+    #- HKDF-SHA256 (RFC 5869) over text inputs. -#
+    static func hkdf(secret: str, salt: str, info: str, length: int = 32) -> Result[str] {
+        out: str = ""
+        problem: str = ""
+        go! {
+            if raw, err := keyringHkdf(secret, salt, info, length); err != nil {
+                problem = err.Error()
+            } else {
+                out = hex.EncodeToString([]byte(raw))
+            }
+        }
+        if problem != "" {
+            return Result.Err(Error("InvalidKey", f"HKDF: {problem}"))
+        }
+        return Result.Ok(out)
+    }
+
+    #- HKDF-SHA256 over hex inputs (for test vectors and binary secrets). -#
+    static func hkdfHex(secretHex: str, saltHex: str, infoHex: str, length: int = 32) -> Result[str] {
+        out: str = ""
+        problem: str = ""
+        go! {
+            secret, e1 := hex.DecodeString(secretHex)
+            salt, e2 := hex.DecodeString(saltHex)
+            info, e3 := hex.DecodeString(infoHex)
+            if e1 != nil || e2 != nil || e3 != nil {
+                problem = "inputs must be hexadecimal"
+            } else if raw, err := keyringHkdf(string(secret), string(salt), string(info), length); err != nil {
+                problem = err.Error()
+            } else {
+                out = hex.EncodeToString([]byte(raw))
+            }
+        }
+        if problem != "" {
+            return Result.Err(Error("InvalidKey", f"HKDF: {problem}"))
+        }
+        return Result.Ok(out)
+    }
+
+    #- HMAC-SHA256(key=secret, message=label): the derivation used by the
+       managed-file-transfer SecretBox (``keyFrom``, label
+       ``mft:secret-box:v1``). Prefer ``hkdf`` for new derivations. -#
+    static func legacyHmac(secret: str, label: str) -> str {
+        out: str = ""
+        go! {
+            mac := hmac.New(sha256.New, []byte(secret))
+            mac.Write([]byte(label))
+            out = hex.EncodeToString(mac.Sum(nil))
+        }
+        return out
+    }
+
+    #- PBKDF2-HMAC-SHA256 (RFC 8018) for keys derived from a password. -#
+    static func pbkdf2(password: str, saltHex: str, iterations: int, length: int = 32) -> Result[str] {
+        out: str = ""
+        problem: str = ""
+        go! {
+            salt, err := hex.DecodeString(saltHex)
+            switch {
+            case err != nil:
+                problem = "the salt must be hexadecimal"
+            case iterations < 1:
+                problem = "iterations must be positive"
+            case length < 1:
+                problem = "the length must be positive"
+            default:
+                if raw, err := pbkdf2.Key(sha256.New, password, salt, iterations, length); err != nil {
+                    problem = err.Error()
+                } else {
+                    out = hex.EncodeToString(raw)
+                }
+            }
+        }
+        if problem != "" {
+            return Result.Err(Error("InvalidKey", f"PBKDF2: {problem}"))
+        }
+        return Result.Ok(out)
+    }
+
+    #- ``size`` random bytes (crypto/rand) as hex. -#
+    static func randomHex(size: int = 16) -> str {
+        out: str = ""
+        go! {
+            buf := make([]byte, size)
+            if _, err := cryptorand.Read(buf); err != nil {
+                panic("keyring: crypto/rand failed: " + err.Error())
+            }
+            out = hex.EncodeToString(buf)
+        }
+        return out
+    }
+}
+
+#- An ordered set of 32-byte AES-256-GCM keys with ids; the primary key
+   seals, every key opens. -#
+class KeyRing {
+    func init(self, ids: list[str], keys: list[str], roots: list[str], primary: int, purpose: str) {
+        self._ids: list[str] = ids
+        self._keys: list[str] = keys
+        self._roots: list[str] = roots
+        self._primary: int = primary
+        self._purpose: str = purpose
+    }
+
+    # ── Construction ─────────────────────────────────────────────
+
+    #- Parses ``id=hex;id=hex`` (``,`` also separates entries and ``id:hex``
+       is accepted, so ``DATA_ENCRYPTION_KEYS``-style ``id:hex,id:hex``
+       parses too; a leading ``ring:`` is ignored). Keys are 64 hex
+       characters. An entry without an id is an unlabelled (legacy) key.
+       ``primary`` selects the sealing key; the first entry by default. -#
+    static func parse(spec: str, primary: str = "") -> Result[KeyRing] {
+        ids: list[str] = []
+        keys: list[str] = []
+        problem: str = ""
+        go! {
+            text := strings.TrimSpace(spec)
+            text = strings.TrimPrefix(text, "ring:")
+            entries := strings.FieldsFunc(text, func(r rune) bool { return r == ';' || r == ',' })
+            seen := map[string]bool{}
+            for n, entry := range entries {
+                entry = strings.TrimSpace(entry)
+                if entry == "" {
+                    continue
+                }
+                id, value := "", entry
+                if i := strings.IndexAny(entry, "=:"); i >= 0 {
+                    id, value = strings.TrimSpace(entry[:i]), entry[i+1:]
+                    if !keyringValidId(id) {
+                        problem = "entry " + strconv.Itoa(n+1) + ": invalid key id (use letters, digits and punctuation other than : ; , =)"
+                        break
+                    }
+                }
+                raw, ok := keyringDecodeHexKey(value)
+                if !ok {
+                    label := id
+                    if label == "" {
+                        label = "entry " + strconv.Itoa(n+1)
+                    }
+                    problem = "key " + label + " must be 32 bytes written as 64 hex characters (openssl rand -hex 32)"
+                    break
+                }
+                if seen[id] {
+                    if id == "" {
+                        problem = "only one key may be unlabelled"
+                    } else {
+                        problem = "duplicate key id " + id
+                    }
+                    break
+                }
+                seen[id] = true
+                ids = append(ids, id)
+                keys = append(keys, raw)
+            }
+            if problem == "" && len(ids) == 0 {
+                problem = "the key ring is empty"
+            }
+        }
+        if problem != "" {
+            return Result.Err(Error("InvalidKey", problem))
+        }
+        return KeyRing._build(ids, keys, primary)
+    }
+
+    #- Parses the key ring in environment variable ``name``. -#
+    static func fromEnv(name: str, primary: str = "") -> Result[KeyRing] {
+        spec: str = Env.getOr(name, "")
+        if spec.trim() == "" {
+            return Result.Err(Error("InvalidKey", f"environment variable {name} is not set"))
+        }
+        parsed: Result[KeyRing] = KeyRing.parse(spec, primary)
+        if not parsed.ok() {
+            return Result.Err(Error("InvalidKey", f"{name}: {parsed.error.message}"))
+        }
+        return parsed
+    }
+
+    #- A ring of one key (``id`` empty = unlabelled legacy key). -#
+    static func single(id: str, hexKey: str) -> Result[KeyRing] {
+        if id == "" {
+            return KeyRing.parse(hexKey)
+        }
+        return KeyRing.parse(f"{id}={hexKey}")
+    }
+
+    #- A ring of one key derived from ``secret`` with HKDF-SHA256
+       (``info`` = ``label``, optional ``salt``). -#
+    static func derive(secret: str, label: str, id: str = "derived", salt: str = "") -> Result[KeyRing] {
+        if secret == "" {
+            return Result.Err(Error("InvalidKey", "cannot derive a key from an empty secret"))
+        }
+        if label == "" {
+            return Result.Err(Error("InvalidKey", "a derivation label is required"))
+        }
+        derived: str = KeyDerivation.hkdf(secret, salt, label)?
+        return KeyRing.single(id, derived)
+    }
+
+    #- A ring of one key derived as HMAC-SHA256(secret, label), the
+       managed-file-transfer SecretBox derivation. With the default empty
+       ``id`` the key is unlabelled and seals legacy (unprefixed) values. -#
+    static func deriveLegacy(secret: str, label: str, id: str = "") -> Result[KeyRing] {
+        if secret == "" {
+            return Result.Err(Error("InvalidKey", "cannot derive a key from an empty secret"))
+        }
+        return KeyRing.single(id, KeyDerivation.legacyHmac(secret, label))
+    }
+
+    #- A ring of one key derived from a password with PBKDF2-HMAC-SHA256.
+       Store ``saltHex`` (``KeyDerivation.randomHex(16)``) next to the data. -#
+    static func fromPassword(password: str, saltHex: str, id: str = "password", iterations: int = 600000) -> Result[KeyRing] {
+        if password == "" {
+            return Result.Err(Error("InvalidKey", "the password is empty"))
+        }
+        if len(saltHex) < 32 {
+            return Result.Err(Error("InvalidKey", "the salt must be at least 16 bytes (32 hex characters)"))
+        }
+        derived: str = KeyDerivation.pbkdf2(password, saltHex, iterations)?
+        return KeyRing.single(id, derived)
+    }
+
+    #- ``spec`` followed by a fallback key derived from ``fallbackSecret``
+       with the legacy derivation, under ``fallbackId``. With an empty
+       ``spec`` the ring is only the unlabelled fallback key, which seals
+       legacy values. This is the managed-file-transfer configuration:
+       ``KeyRing.withFallback(DATA_ENCRYPTION_KEYS, JWT_SECRET, "mft:secret-box:v1")``. -#
+    static func withFallback(spec: str, fallbackSecret: str, label: str, fallbackId: str = "legacy") -> Result[KeyRing] {
+        if spec.trim() == "" {
+            return KeyRing.deriveLegacy(fallbackSecret, label)
+        }
+        ring: KeyRing = KeyRing.parse(spec)?
+        if fallbackSecret == "" {
+            return Result.Ok(ring)
+        }
+        return ring.add(fallbackId, KeyDerivation.legacyHmac(fallbackSecret, label))
+    }
+
+    #- A new random 32-byte key as 64 hex characters. -#
+    static func generateKey() -> str {
+        return KeyDerivation.randomHex(32)
+    }
+
+    private static func _build(ids: list[str], keys: list[str], primary: str) -> Result[KeyRing] {
+        index: int = 0
+        if primary != "" {
+            index = -1
+            for i in range(len(ids)) {
+                if ids[i] == primary {
+                    index = i
+                }
+            }
+            if index < 0 {
+                return Result.Err(Error("KeyNotFound", f"primary key {primary} is not in the key ring"))
+            }
+        }
+        roots: list[str] = []
+        for k in keys {
+            roots.append(k)
+        }
+        return Result.Ok(KeyRing(ids, keys, roots, index, ""))
+    }
+
+    # ── Inspection ───────────────────────────────────────────────
+
+    func primaryId(self) -> str {
+        return self._ids[self._primary]
+    }
+
+    func ids(self) -> list[str] {
+        out: list[str] = []
+        for id in self._ids {
+            out.append(id)
+        }
+        return out
+    }
+
+    func has(self, id: str) -> bool {
+        return self._index(id) >= 0
+    }
+
+    func size(self) -> int {
+        return len(self._ids)
+    }
+
+    #- The purpose path of a ``forPurpose`` ring (``a/b`` when nested). -#
+    func purpose(self) -> str {
+        return self._purpose
+    }
+
+    #- The ring as ``id=hex;...`` (primary first). Contains the keys:
+       treat it as a secret. Purpose rings refuse (store the root ring). -#
+    func toSpec(self) -> Result[str] {
+        if self._purpose != "" {
+            return Result.Err(Error("InvalidKey", "a purpose ring cannot be exported; export the ring it was derived from"))
+        }
+        entries: list[str] = [KeyRing._entry(self._ids[self._primary], self._keys[self._primary])]
+        for i in range(len(self._ids)) {
+            if i != self._primary {
+                entries.append(KeyRing._entry(self._ids[i], self._keys[i]))
+            }
+        }
+        return Result.Ok(";".join(entries))
+    }
+
+    private static func _entry(id: str, key: str) -> str {
+        text: str = ""
+        go! {
+            text = hex.EncodeToString([]byte(key))
+        }
+        if id == "" {
+            return text
+        }
+        return f"{id}={text}"
+    }
+
+    #- Never shows key material. -#
+    func __str__(self) -> str {
+        shown: list[str] = [("(unlabelled)" if id == "" else id) for id in self._ids]
+        suffix: str = "" if self._purpose == "" else f", purpose={self._purpose}"
+        return f"KeyRing(primary={shown[self._primary]}, ids={shown}{suffix})"
+    }
+
+    #- Describes a sealed value without opening it. -#
+    static func inspect(sealed: str) -> Result[SealedInfo] {
+        version: str = ""
+        id: str = ""
+        go! {
+            version, id, _ = keyringSplitSealed(sealed)
+        }
+        if sealed == "" or version == "" {
+            return Result.Err(Error("Corrupted", "not a sealed value"))
+        }
+        return Result.Ok(SealedInfo(version, id, version == "v3"))
+    }
+
+    #- Compares two secrets (tokens, MACs, codes) in constant time. Both
+       sides are hashed first, so the time does not depend on where they
+       differ nor reveal the length of the expected value. -#
+    static func constantTimeEquals(a: str, b: str) -> bool {
+        out: bool = false
+        go! {
+            ha := sha256.Sum256([]byte(a))
+            hb := sha256.Sum256([]byte(b))
+            out = subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
+        }
+        return out
+    }
+
+    # ── Changing the ring (each returns a new ring) ──────────────
+
+    #- Adds a non-primary key (e.g. an old key kept to open old values). -#
+    func add(self, id: str, hexKey: str) -> Result[KeyRing] {
+        if self._purpose != "" {
+            return Result.Err(Error("InvalidKey", "add keys to the root ring, then call forPurpose"))
+        }
+        if self.has(id) {
+            return Result.Err(Error("InvalidKey", f"duplicate key id {id}" if id != "" else "only one key may be unlabelled"))
+        }
+        extra: KeyRing = KeyRing.single(id, hexKey)?
+        return self.merge(extra)
+    }
+
+    #- The keys of ``other`` appended to this ring; the primary is unchanged. -#
+    func merge(self, other: KeyRing) -> Result[KeyRing] {
+        if self._purpose != other._purpose {
+            return Result.Err(Error("InvalidKey", "cannot merge rings with different purposes"))
+        }
+        ids: list[str] = self.ids()
+        keys: list[str] = [k for k in self._keys]
+        roots: list[str] = [k for k in self._roots]
+        for i in range(len(other._ids)) {
+            if self.has(other._ids[i]) {
+                label: str = "(unlabelled)" if other._ids[i] == "" else other._ids[i]
+                return Result.Err(Error("InvalidKey", f"duplicate key id {label}"))
+            }
+            ids.append(other._ids[i])
+            keys.append(other._keys[i])
+            roots.append(other._roots[i])
+        }
+        return Result.Ok(KeyRing(ids, keys, roots, self._primary, self._purpose))
+    }
+
+    #- The same keys with ``id`` sealing. -#
+    func withPrimary(self, id: str) -> Result[KeyRing] {
+        index: int = self._index(id)
+        if index < 0 {
+            return Result.Err(Error("KeyNotFound", f"key {id} is not in the key ring"))
+        }
+        return Result.Ok(KeyRing(self.ids(), [k for k in self._keys], [k for k in self._roots], index, self._purpose))
+    }
+
+    #- The ring without key ``id`` (retire a key after resealing). -#
+    func without(self, id: str) -> Result[KeyRing] {
+        index: int = self._index(id)
+        if index < 0 {
+            return Result.Err(Error("KeyNotFound", f"key {id} is not in the key ring"))
+        }
+        if index == self._primary {
+            return Result.Err(Error("InvalidKey", "cannot remove the primary key; choose another primary first"))
+        }
+        ids: list[str] = []
+        keys: list[str] = []
+        roots: list[str] = []
+        for i in range(len(self._ids)) {
+            if i != index {
+                ids.append(self._ids[i])
+                keys.append(self._keys[i])
+                roots.append(self._roots[i])
+            }
+        }
+        primary: int = self._primary if self._primary < index else self._primary - 1
+        return Result.Ok(KeyRing(ids, keys, roots, primary, self._purpose))
+    }
+
+    #- A ring whose keys are HKDF subkeys for ``purpose`` (same ids), so
+       values sealed for one purpose (``totp``) cannot be opened as another
+       (``sso``). Nested calls derive further (``a/b``). Throws ValueError
+       on an empty purpose. -#
+    func forPurpose(self, purpose: str) -> KeyRing {
+        if purpose == "" {
+            throw ValueError("keyring: purpose must not be empty")
+        }
+        keys: list[str] = []
+        for key in self._keys {
+            sub: str = ""
+            go! {
+                derived, err := keyringHkdf(key, "", keyringPurposeInfo+purpose, keyringKeySize)
+                if err != nil {
+                    panic("keyring: " + err.Error())
+                }
+                sub = derived
+            }
+            keys.append(sub)
+        }
+        path: str = purpose if self._purpose == "" else f"{self._purpose}/{purpose}"
+        return KeyRing(self.ids(), keys, [k for k in self._roots], self._primary, path)
+    }
+
+    private func _index(self, id: str) -> int {
+        for i in range(len(self._ids)) {
+            if self._ids[i] == id {
+                return i
+            }
+        }
+        return -1
+    }
+
+    # ── Sealing ──────────────────────────────────────────────────
+
+    #- Encrypts ``plaintext`` with the primary key. Without ``aad`` the
+       value is ``v2:<id>:...``; with ``aad`` it is ``v3:<id>:...`` and
+       opens only with the same ``aad`` (bind it to table/column/row id).
+       An unlabelled primary key seals legacy values (no ``aad``). -#
+    func seal(self, plaintext: str, aad: str = "") -> Result[str] {
+        id: str = self._ids[self._primary]
+        key: str = self._keys[self._primary]
+        root: str = self._roots[self._primary]
+        if id == "" and aad != "" {
+            return Result.Err(Error("InvalidKey", "an unlabelled (legacy) primary key cannot bind associated data; give the key an id"))
+        }
+        out: str = ""
+        problem: str = ""
+        go! {
+            raw, err := keyringSealRaw(key, plaintext, aad)
+            if err != nil {
+                problem = err.Error()
+            } else if id == "" {
+                out = base64.StdEncoding.EncodeToString(raw)
+            } else if aad == "" {
+                out = "v2:" + id + ":" + base64.StdEncoding.EncodeToString(raw)
+            } else {
+                payload := append([]byte(keyringAadCheck(root, aad)), raw...)
+                out = "v3:" + id + ":" + base64.StdEncoding.EncodeToString(payload)
+            }
+        }
+        if problem != "" {
+            return Result.Err(Error("CryptoError", problem))
+        }
+        return Result.Ok(out)
+    }
+
+    #- Decrypts a value sealed by any key of the ring. Errors:
+       ``KeyNotFound`` (its key id is not in the ring), ``WrongAssociatedData``
+       (``aad`` differs from the one it was sealed with) and ``Corrupted``
+       (malformed, tampered, wrong key material or wrong purpose). -#
+    func open(self, sealed: str, aad: str = "") -> Result[str] {
+        version: str = ""
+        id: str = ""
+        data: str = ""
+        go! {
+            version, id, data = keyringSplitSealed(sealed)
+        }
+        if sealed == "" or version == "" {
+            return Result.Err(Error("Corrupted", "sealed value is malformed"))
+        }
+        if version == "v3" and aad == "" {
+            return Result.Err(Error("WrongAssociatedData", "the value is bound to associated data; pass the aad it was sealed with"))
+        }
+        if version != "v3" and aad != "" {
+            return Result.Err(Error("WrongAssociatedData", "the value was sealed without associated data"))
+        }
+        if version == "legacy" {
+            return self._openLegacy(data)
+        }
+        index: int = self._index(id)
+        if index < 0 {
+            return Result.Err(Error("KeyNotFound", f"the value was sealed with key {id}, which is not in the key ring"))
+        }
+        key: str = self._keys[index]
+        root: str = self._roots[index]
+        out: str = ""
+        kind: str = ""
+        go! {
+            raw, err := base64.StdEncoding.Strict().DecodeString(data)
+            switch {
+            case err != nil:
+                kind = "malformed"
+            case version == "v3":
+                if len(raw) < keyringCheckSize+keyringNonceSize+keyringTagSize {
+                    kind = "malformed"
+                } else if subtle.ConstantTimeCompare(raw[:keyringCheckSize], []byte(keyringAadCheck(root, aad))) != 1 {
+                    kind = "aad"
+                } else if plain, ok := keyringOpenRaw(key, raw[keyringCheckSize:], aad); ok {
+                    out = plain
+                } else {
+                    kind = "auth"
+                }
+            default:
+                if len(raw) < keyringNonceSize+keyringTagSize {
+                    kind = "malformed"
+                } else if plain, ok := keyringOpenRaw(key, raw, ""); ok {
+                    out = plain
+                } else {
+                    kind = "auth"
+                }
+            }
+        }
+        if kind == "malformed" {
+            return Result.Err(Error("Corrupted", "sealed value is malformed"))
+        }
+        if kind == "aad" {
+            return Result.Err(Error("WrongAssociatedData", "the associated data does not match the value (moved to another row or context?)"))
+        }
+        if kind == "auth" {
+            return Result.Err(Error("Corrupted", f"sealed value cannot be opened with key {id} (tampered, wrong key material or wrong purpose)"))
+        }
+        return Result.Ok(out)
+    }
+
+    private func _openLegacy(self, data: str) -> Result[str] {
+        keys: list[str] = self._keys
+        out: str = ""
+        kind: str = ""
+        go! {
+            raw, err := base64.StdEncoding.Strict().DecodeString(data)
+            if err != nil || len(raw) < keyringNonceSize+keyringTagSize {
+                kind = "malformed"
+            } else {
+                kind = "auth"
+                for _, key := range keys {
+                    if plain, ok := keyringOpenRaw(key, raw, ""); ok {
+                        out, kind = plain, ""
+                        break
+                    }
+                }
+            }
+        }
+        if kind == "malformed" {
+            return Result.Err(Error("Corrupted", "sealed value is malformed"))
+        }
+        if kind == "auth" {
+            return Result.Err(Error("Corrupted", "no key of the ring opens this legacy value (tampered or the key is missing)"))
+        }
+        return Result.Ok(out)
+    }
+
+    #- True when ``sealed`` is not sealed with the primary key (legacy
+       values, older keys, malformed values). Empty values never need it;
+       a ring whose primary key is unlabelled (legacy mode) never reseals. -#
+    func needsReseal(self, sealed: str) -> bool {
+        id: str = self._ids[self._primary]
+        if sealed == "" or id == "" {
+            return False
+        }
+        return not (sealed.startsWith(f"v2:{id}:") or sealed.startsWith(f"v3:{id}:"))
+    }
+
+    #- ``sealed`` re-encrypted with the primary key when ``needsReseal``,
+       otherwise ``sealed`` unchanged. -#
+    func reseal(self, sealed: str, aad: str = "") -> Result[str] {
+        if not self.needsReseal(sealed) {
+            return Result.Ok(sealed)
+        }
+        plain: str = self.open(sealed, aad)?
+        return self.seal(plain, aad)
+    }
+
+    #- Opens with ``fromAad`` and seals again (primary key) with ``toAad``:
+       bind existing values to associated data, or follow a row whose id
+       changed. -#
+    func rebind(self, sealed: str, fromAad: str, toAad: str) -> Result[str] {
+        plain: str = self.open(sealed, fromAad)?
+        return self.seal(plain, toAad)
+    }
+
+    # ── Envelope keys ────────────────────────────────────────────
+
+    #- Seals a 32-byte data key (64 hex characters). The plaintext is the
+       lowercase hex text, as managed-file-transfer stores namespace keys. -#
+    func wrapKey(self, dataKeyHex: str, aad: str = "") -> Result[str] {
+        clean: str = dataKeyHex.trim().toLower()
+        valid: bool = False
+        go! {
+            valid = keyringIsHexKey(clean)
+        }
+        if not valid {
+            return Result.Err(Error("InvalidKey", "a data key must be 32 bytes written as 64 hex characters"))
+        }
+        return self.seal(clean, aad)
+    }
+
+    #- Opens a wrapped data key and returns its 64 hex characters. -#
+    func unwrapKey(self, wrapped: str, aad: str = "") -> Result[str] {
+        plain: str = self.open(wrapped, aad)?
+        clean: str = plain.toLower()
+        valid: bool = False
+        go! {
+            valid = keyringIsHexKey(clean) && len(clean) == 64
+        }
+        if not valid {
+            return Result.Err(Error("Corrupted", "the wrapped value is not a 32-byte data key"))
+        }
+        return Result.Ok(clean)
+    }
+
+    #- A new random data key and its wrapped form. -#
+    func newWrappedKey(self, aad: str = "") -> Result[WrappedKey] {
+        key: str = KeyRing.generateKey()
+        wrapped: str = self.wrapKey(key, aad)?
+        return Result.Ok(WrappedKey(key, wrapped))
+    }
+
+    #- Unwraps a data key into a one-key ring with id ``id`` (e.g. a
+       per-tenant or per-file ring). -#
+    func unwrapRing(self, wrapped: str, id: str, aad: str = "") -> Result[KeyRing] {
+        key: str = self.unwrapKey(wrapped, aad)?
+        return KeyRing.single(id, key)
+    }
+}
+
+func main() {
+    pass
+}

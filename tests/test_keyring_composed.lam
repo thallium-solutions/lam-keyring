@@ -1,0 +1,240 @@
+# Test: @lam/keyring — composed lifecycle of an application's secrets:
+# JWT_SECRET-derived legacy mode -> a configured key ring with row-bound
+# values -> a key rotation resealed in batches -> retired keys, with
+# purpose-scoped and envelope (per-tenant) keys along the way. Exercises
+# classes, an interface, lambdas over shared state, match/case on error
+# kinds, comprehensions, enumerate, for-else, slicing and Result
+# propagation through do/catch.
+#
+# expect: phase 1: KeyRing(primary=(unlabelled), ids=[(unlabelled)]) legacy=3
+# expect: phase 2 ring: KeyRing(primary=k1, ids=[k1 legacy])
+# expect: phase 2 accounts: ResealReport(scanned=3, resealed=3, unchanged=0, failed=0, conflicts=0)
+# expect: phase 2 formats: v3:k1 v3:k1 v3:k1
+# expect: phase 2 tenants: t1=v3:k1 t2=v3:k1
+# expect: phase 2 files: 4 sealed with tenant keys
+# expect: swapped rows: WrongAssociatedData
+# expect: tenant key purpose: Corrupted
+# expect: phase 3 needs work: 5 of 5
+# expect: phase 3 accounts: scanned=3 resealed=3 batches=2
+# expect: phase 3 tenants: scanned=2 resealed=2 batches=1
+# expect: phase 3 files untouched: true
+# expect: phase 4 retired: KeyRing(primary=k2, ids=[k2])
+# expect: account 1: JBSWY3DPEHPK3PXP
+# expect: account 2: KRSXG5CTMVRXEZLU
+# expect: account 3: GEZDGNBVGY3TQOJQ
+# expect: file t1/report.csv: quarterly numbers
+# expect: file t1/notes.txt: remember the milk
+# expect: file t2/invoice.pdf: %PDF-1.7
+# expect: file t2/photo.jpg: JFIF
+# expect: old backup value: KeyNotFound
+# expect: kinds: ok=1 KeyNotFound=1 Corrupted=1 WrongAssociatedData=1
+# expect: crypto-shredding: tenant t2 erased, file unreadable: true
+
+from @lam/keyring import KeyRing, Resealer, ResealReport, SealedItem, WrappedKey
+from lamerrors import Result
+from lamenv import Env
+
+const JWT_SECRET: str = "composed-test-application-secret-0123456789"
+const LABEL: str = "mft:secret-box:v1"
+
+#- Anything that can hand out pages of sealed values and write them back. -#
+interface SealedColumn {
+    func fetch(self, afterId: str, limit: int) -> Result[list[SealedItem]]
+    func store(self, item: SealedItem) -> Result[bool]
+}
+
+#- One sealed column of a table, keyed by row id (ids sort as strings). -#
+class Column {
+    func init(self, table: str, column: str) {
+        self.table: str = table
+        self.column: str = column
+        self.rows: dict[str, str] = {}
+        self.order: list[str] = []
+        self.bindRows: bool = False
+    }
+
+    func aad(self, id: str) -> str {
+        return f"{self.table}.{self.column}:{id}"
+    }
+
+    func put(self, id: str, sealed: str) {
+        if not (id in self.rows) {
+            self.order.append(id)
+        }
+        self.rows[id] = sealed
+    }
+
+    func fetch(self, afterId: str, limit: int) -> Result[list[SealedItem]] {
+        page: list[SealedItem] = []
+        for id in self.order {
+            if len(page) == limit {
+                break
+            }
+            if id > afterId and self.rows[id] != "" {
+                item: SealedItem = SealedItem(id, self.rows[id], self.aad(id) if self.rows[id].startsWith("v3:") else "")
+                if self.bindRows {
+                    _ = item.rebindTo(self.aad(id))
+                }
+                page.append(item)
+            }
+        }
+        return Result.Ok(page)
+    }
+
+    func store(self, item: SealedItem) -> Result[bool] {
+        if self.rows[item.id] != item.sealed {
+            return Result.Ok(False)
+        }
+        self.rows[item.id] = item.resealed
+        return Result.Ok(True)
+    }
+
+    func formats(self) -> list[str] {
+        return [self.rows[id][: 5] for id in self.order]
+    }
+}
+
+#- Every stored value of ``columns`` (lamc 2.1.1 has no list ``+``). -#
+func stored(columns: list[Column]) -> list[str] {
+    out: list[str] = []
+    for column in columns {
+        for id in column.order {
+            out.append(column.rows[id])
+        }
+    }
+    return out
+}
+
+func reseal(resealer: Resealer, column: SealedColumn, batchSize: int) -> Result[ResealReport] {
+    fetch: func(str, int) -> Result[list[SealedItem]] = lambda(afterId: str, limit: int) -> Result[list[SealedItem]]: column.fetch(afterId, limit)
+    store: func(SealedItem) -> Result[bool] = lambda(item: SealedItem) -> Result[bool]: column.store(item)
+    return resealer.run(fetch, store, batchSize)
+}
+
+func kindOf(r: Result[str]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    match r.error.kind {
+        case "KeyNotFound" | "Corrupted" | "WrongAssociatedData" as k {
+            return k
+        }
+        case other {
+            return f"unexpected:{other}"
+        }
+    }
+}
+
+func main() {
+    do {
+        accounts: Column = Column("accounts", "mfa_secret_sealed")
+        tenants: Column = Column("tenants", "data_key_sealed")
+        files: dict[str, str] = {}
+        secrets: list[str] = ["JBSWY3DPEHPK3PXP", "KRSXG5CTMVRXEZLU", "GEZDGNBVGY3TQOJQ"]
+
+        # Phase 1: no key ring configured, the key derives from JWT_SECRET.
+        legacyMode: KeyRing = KeyRing.withFallback(Env.getOr("LAM_KEYRING_COMPOSED_KEYS", ""), JWT_SECRET, LABEL)?
+        for i, secret in enumerate(secrets, 1) {
+            accounts.put(str(i), legacyMode.seal(secret)?)
+        }
+        legacyCount: int = len([f for f in accounts.formats() if not f.startsWith("v")])
+        print(f"phase 1: {legacyMode} legacy={legacyCount}")
+
+        # Phase 2: DATA_ENCRYPTION_KEYS-style configuration; bind account
+        # secrets to their rows while resealing.
+        k1: str = KeyRing.generateKey()
+        _ = Env.set("LAM_KEYRING_COMPOSED_KEYS", f"k1:{k1}")
+        ring: KeyRing = KeyRing.withFallback(Env.getOr("LAM_KEYRING_COMPOSED_KEYS", ""), JWT_SECRET, LABEL)?
+        print(f"phase 2 ring: {ring}")
+        accounts.bindRows = True
+        phase2: ResealReport = reseal(Resealer(ring), accounts, 100)?
+        accounts.bindRows = False
+        print(f"phase 2 accounts: {phase2}")
+        print(f"phase 2 formats: {' '.join(accounts.formats())}")
+
+        tenantKeys: KeyRing = ring.forPurpose("tenant-keys")
+        tenantFiles: dict[str, list[str]] = {"t1": ["report.csv", "notes.txt"], "t2": ["invoice.pdf", "photo.jpg"]}
+        contents: dict[str, str] = {"report.csv": "quarterly numbers", "notes.txt": "remember the milk", "invoice.pdf": "%PDF-1.7", "photo.jpg": "JFIF"}
+        for tenant in ["t1", "t2"] {
+            names: list[str] = tenantFiles[tenant]
+            fresh: WrappedKey = tenantKeys.newWrappedKey(tenants.aad(tenant))?
+            tenants.put(tenant, fresh.wrapped)
+            dataRing: KeyRing = KeyRing.single(tenant, fresh.key)?
+            for name in names {
+                files[f"{tenant}/{name}"] = dataRing.seal(contents[name], f"files:{tenant}/{name}")?
+            }
+        }
+        shown: list[str] = [f"{id}={tenants.rows[id][:5]}" for id in tenants.order]
+        print(f"phase 2 tenants: {' '.join(shown)}")
+        print(f"phase 2 files: {len(files)} sealed with tenant keys")
+        print(f"swapped rows: {kindOf(ring.open(accounts.rows['1'], accounts.aad('2')))}")
+        print(f"tenant key purpose: {kindOf(ring.unwrapKey(tenants.rows['t1'], tenants.aad('t1')))}")
+        filesBefore: dict[str, str] = {name: sealed for name, sealed in files}
+        backup: str = accounts.rows["1"]
+
+        # Phase 3: rotate k1 -> k2 and reseal both columns in batches.
+        k2: str = KeyRing.generateKey()
+        _ = Env.set("LAM_KEYRING_COMPOSED_KEYS", f"k2:{k2},k1:{k1}")
+        rotated: KeyRing = KeyRing.withFallback(Env.getOr("LAM_KEYRING_COMPOSED_KEYS", ""), JWT_SECRET, LABEL)?
+        pending: int = 0
+        total: int = 0
+        for value in stored([accounts, tenants]) {
+            total += 1
+            if rotated.needsReseal(value) {
+                pending += 1
+            }
+        }
+        print(f"phase 3 needs work: {pending} of {total}")
+        phase3a: ResealReport = reseal(Resealer(rotated), accounts, 2)?
+        print(f"phase 3 accounts: scanned={phase3a.scanned} resealed={phase3a.resealed} batches={phase3a.batches}")
+        phase3b: ResealReport = reseal(Resealer(rotated.forPurpose("tenant-keys")), tenants, 2)?
+        print(f"phase 3 tenants: scanned={phase3b.scanned} resealed={phase3b.resealed} batches={phase3b.batches}")
+        untouched: bool = True
+        for name, sealed in files {
+            if filesBefore[name] != sealed {
+                untouched = False
+            }
+        }
+        print(f"phase 3 files untouched: {untouched}")
+
+        # Phase 4: every value is on k2; retire k1 and the JWT_SECRET key.
+        for value in stored([accounts, tenants]) {
+            if rotated.needsReseal(value) {
+                print("still pending, cannot retire")
+                break
+            }
+        } else {
+            rotated = (rotated.without("k1")?).without("legacy")?
+        }
+        print(f"phase 4 retired: {rotated}")
+        for id in accounts.order {
+            print(f"account {id}: {rotated.open(accounts.rows[id], accounts.aad(id))?}")
+        }
+        newTenantKeys: KeyRing = rotated.forPurpose("tenant-keys")
+        for tenant in ["t1", "t2"] {
+            dataRing: KeyRing = newTenantKeys.unwrapRing(tenants.rows[tenant], tenant, tenants.aad(tenant))?
+            for name in tenantFiles[tenant] {
+                print(f"file {tenant}/{name}: {dataRing.open(files[tenant + '/' + name], f'files:{tenant}/{name}')?}")
+            }
+        }
+        print(f"old backup value: {kindOf(rotated.open(backup, accounts.aad('1')))}")
+
+        outcomes: list[str] = []
+        outcomes.append(kindOf(rotated.open(accounts.rows["2"], accounts.aad("2"))))
+        outcomes.append(kindOf(rotated.open(backup, accounts.aad("1"))))
+        outcomes.append(kindOf(rotated.open(accounts.rows["3"][: len(accounts.rows["3"]) - 8] + "AAAAAAAA", accounts.aad("3"))))
+        outcomes.append(kindOf(rotated.open(accounts.rows["3"], accounts.aad("2"))))
+        counts: dict[str, int] = {}
+        for outcome in outcomes {
+            counts[outcome] = (counts[outcome] if outcome in counts else 0) + 1
+        }
+        print(f"kinds: ok={counts['ok']} KeyNotFound={counts['KeyNotFound']} Corrupted={counts['Corrupted']} WrongAssociatedData={counts['WrongAssociatedData']}")
+
+        # Deleting a tenant's wrapped key makes its files unreadable.
+        tenants.rows["t2"] = ""
+        gone: Result[KeyRing] = newTenantKeys.unwrapRing(tenants.rows["t2"], "t2", tenants.aad("t2"))
+        print(f"crypto-shredding: tenant t2 erased, file unreadable: {not gone.ok()}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

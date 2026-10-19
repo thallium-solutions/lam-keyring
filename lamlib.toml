@@ -1,0 +1,15 @@
+[library]
+name = "@lam/keyring"
+version = "1.0.0"
+description = "Sealing secrets at rest for Lammergeier: AES-256-GCM key rings with key ids, rotation, associated data, purpose subkeys and envelope keys"
+license = "Apache-2.0"
+authors = ["Lammergeier contributors"]
+repository = "https://github.com/thallium-solutions/lam-keyring"
+homepage = "https://github.com/thallium-solutions/lam-keyring"
+
+[compatibility]
+lamc = ">=2.1, <4"
+
+[scripts]
+test = "python3 tests/run_lamkeyring_tests.py --verbose"
+format = "lamc fmt ."

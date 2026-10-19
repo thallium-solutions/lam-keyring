@@ -1,0 +1,109 @@
+# Test: @lam/keyring — key derivation: RFC 5869 HKDF vectors, the legacy
+# managed-file-transfer derivation, PBKDF2 and derived rings.
+#
+# expect: rfc5869 case 1: true
+# expect: rfc5869 case 2: true
+# expect: rfc5869 case 3: true
+# expect: hkdf text: b795b916e121d6813c344c7c9fdf4108c9a8af828214676448b60128860263fa
+# expect: hkdf length 16: 32
+# expect: hkdf too long: InvalidKey
+# expect: hkdf not hex: InvalidKey HKDF: inputs must be hexadecimal
+# expect: legacy hmac: eb260a9a1c5185f49ac7134f992190a9317cda324f8d067a8d1a2ee57314b15f
+# expect: legacy hmac empty secret: 4978473026a356a6207fd918ff2f5ddf78cec294456bd27f8c8dabe3c94d074f
+# expect: derive: derived=b795b916e121d6813c344c7c9fdf4108c9a8af828214676448b60128860263fa
+# expect: derive salt and id: app=a15c3406ab4772841cfa79b4103da3de8d543a5fb8d619a97fe90769cf6662f9
+# expect: derive labels differ: true
+# expect: derive empty secret: InvalidKey cannot derive a key from an empty secret
+# expect: derive empty label: InvalidKey a derivation label is required
+# expect: deriveLegacy: eb260a9a1c5185f49ac7134f992190a9317cda324f8d067a8d1a2ee57314b15f
+# expect: deriveLegacy labelled: legacy=eb260a9a1c5185f49ac7134f992190a9317cda324f8d067a8d1a2ee57314b15f
+# expect: pbkdf2 c=1: 120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b
+# expect: pbkdf2 c=4096: c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a
+# expect: pbkdf2 bad iterations: InvalidKey PBKDF2: iterations must be positive
+# expect: fromPassword: password=a69b179e3add3c1e0aaf227a0eb3aa2aa8645ab86fecf6ca00c17512697c719e
+# expect: fromPassword round trip: secret
+# expect: fromPassword short salt: InvalidKey
+# expect: fromPassword empty: InvalidKey
+# expect: randomHex: 32 true
+# expect: withFallback empty spec: KeyRing(primary=(unlabelled), ids=[(unlabelled)])
+# expect: withFallback: KeyRing(primary=k2, ids=[k2 legacy])
+# expect: withFallback no secret: KeyRing(primary=k2, ids=[k2])
+# expect: withFallback custom id: KeyRing(primary=k2, ids=[k2 jwt])
+
+from @lam/keyring import KeyRing, KeyDerivation
+from lamerrors import Result
+
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+const SECRET: str = "a-long-application-secret-0123456789"
+
+func failure(r: Result[str]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func ringFailure(r: Result[KeyRing]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return f"{r.error.kind} {r.error.message}"
+}
+
+func main() {
+    do {
+        # RFC 5869 appendix A, test cases 1-3 (SHA-256).
+        c1: str = KeyDerivation.hkdfHex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", "000102030405060708090a0b0c", "f0f1f2f3f4f5f6f7f8f9", 42)?
+        print(f"rfc5869 case 1: {c1 == '3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865'}")
+        ikm2: str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f"
+        salt2: str = "606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+        info2: str = "b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+        c2: str = KeyDerivation.hkdfHex(ikm2, salt2, info2, 82)?
+        print(f"rfc5869 case 2: {c2 == 'b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87'}")
+        c3: str = KeyDerivation.hkdfHex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", "", "", 42)?
+        print(f"rfc5869 case 3: {c3 == '8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8'}")
+
+        print(f"hkdf text: {KeyDerivation.hkdf(SECRET, '', 'myapp:keyring:v1')?}")
+        print(f"hkdf length 16: {len(KeyDerivation.hkdf(SECRET, '', 'x', 16)?)}")
+        print(f"hkdf too long: {failure(KeyDerivation.hkdf(SECRET, '', 'x', 255 * 32 + 1))}")
+        notHex: Result[str] = KeyDerivation.hkdfHex("zz", "", "")
+        print(f"hkdf not hex: {notHex.error.kind} {notHex.error.message}")
+
+        print(f"legacy hmac: {KeyDerivation.legacyHmac(SECRET, 'mft:secret-box:v1')}")
+        print(f"legacy hmac empty secret: {KeyDerivation.legacyHmac('', 'mft:secret-box:v1')}")
+
+        derived: KeyRing = KeyRing.derive(SECRET, "myapp:keyring:v1")?
+        print(f"derive: {derived.toSpec()?}")
+        salted: KeyRing = KeyRing.derive(SECRET, "myapp:keyring:v1", "app", "pepper")?
+        print(f"derive salt and id: {salted.toSpec()?}")
+        other: KeyRing = KeyRing.derive(SECRET, "myapp:keyring:v2")?
+        print(f"derive labels differ: {other.toSpec()? != derived.toSpec()?}")
+        print(f"derive empty secret: {ringFailure(KeyRing.derive('', 'x'))}")
+        print(f"derive empty label: {ringFailure(KeyRing.derive(SECRET, ''))}")
+
+        legacy: KeyRing = KeyRing.deriveLegacy(SECRET, "mft:secret-box:v1")?
+        print(f"deriveLegacy: {legacy.toSpec()?}")
+        labelled: KeyRing = KeyRing.deriveLegacy(SECRET, "mft:secret-box:v1", "legacy")?
+        print(f"deriveLegacy labelled: {labelled.toSpec()?}")
+
+        print(f"pbkdf2 c=1: {KeyDerivation.pbkdf2('password', '73616c74', 1)?}")
+        print(f"pbkdf2 c=4096: {KeyDerivation.pbkdf2('password', '73616c74', 4096)?}")
+        badIter: Result[str] = KeyDerivation.pbkdf2("password", "73616c74", 0)
+        print(f"pbkdf2 bad iterations: {badIter.error.kind} {badIter.error.message}")
+        pw: KeyRing = KeyRing.fromPassword("correct horse battery staple", "000102030405060708090a0b0c0d0e0f", "password", 1000)?
+        print(f"fromPassword: {pw.toSpec()?}")
+        print(f"fromPassword round trip: {pw.open(pw.seal('secret')?)?}")
+        print(f"fromPassword short salt: {ringFailure(KeyRing.fromPassword('pw', '0011')).split(' ')[0]}")
+        print(f"fromPassword empty: {ringFailure(KeyRing.fromPassword('', '000102030405060708090a0b0c0d0e0f')).split(' ')[0]}")
+
+        r1: str = KeyDerivation.randomHex()
+        print(f"randomHex: {len(r1)} {r1 != KeyDerivation.randomHex()}")
+
+        print(f"withFallback empty spec: {KeyRing.withFallback('  ', SECRET, 'mft:secret-box:v1')?}")
+        print(f"withFallback: {KeyRing.withFallback(f'k2:{K2}', SECRET, 'mft:secret-box:v1')?}")
+        print(f"withFallback no secret: {KeyRing.withFallback(f'k2:{K2}', '', 'mft:secret-box:v1')?}")
+        print(f"withFallback custom id: {KeyRing.withFallback(f'k2:{K2}', SECRET, 'mft:secret-box:v1', 'jwt')?}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

@@ -1,0 +1,93 @@
+# Test: @lam/keyring — associated data binds a value to its row.
+#
+# expect: v3 prefix: true
+# expect: same row opens: JBSWY3DPEHPK3PXP
+# expect: moved to another row: WrongAssociatedData the associated data does not match the value (moved to another row or context?)
+# expect: other column: WrongAssociatedData
+# expect: opened without aad: WrongAssociatedData the value is bound to associated data; pass the aad it was sealed with
+# expect: v2 value with aad: WrongAssociatedData the value was sealed without associated data
+# expect: legacy value with aad: WrongAssociatedData
+# expect: tampered ciphertext: Corrupted
+# expect: tampered check: WrongAssociatedData
+# expect: truncated v3: Corrupted
+# expect: older key opens with aad: true
+# expect: unknown key with aad: KeyNotFound
+# expect: inspect v3: SealedInfo(version=v3, keyId=k2, boundToAad=true)
+# expect: rebind v2 to row: true true
+# expect: rebind row to row: WrongAssociatedData no-aad
+# expect: binary aad: true WrongAssociatedData
+# expect: python v3 fixture: interop-v3
+# expect: python v3 fixture wrong row: WrongAssociatedData
+
+from @lam/keyring import KeyRing
+from lamerrors import Result
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+# Sealed per README "Format" by an independent Python implementation
+# (cryptography.AESGCM, fixed nonce 000102...0b), key k2 = 22..22,
+# aad "accounts.mfa_secret_sealed:42".
+const PY_V3: str = "v3:k2:l18eYfmF808AAQIDBAUGBwgJCgsvruN6yUL46U4FYf1ex1FXBrjl121rPgHYgA=="
+
+func rowAad(table: str, column: str, id: int) -> str {
+    return f"{table}.{column}:{id}"
+}
+
+func describe(r: Result[str]) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func main() {
+    do {
+        ring: KeyRing = KeyRing.parse(f"k2={K2};k1={K1}")?
+        aad: str = rowAad("accounts", "mfa_secret_sealed", 42)
+        sealed: str = ring.seal("JBSWY3DPEHPK3PXP", aad)?
+        print(f"v3 prefix: {sealed.startsWith('v3:k2:')}")
+        print(f"same row opens: {ring.open(sealed, aad)?}")
+        moved: Result[str] = ring.open(sealed, rowAad("accounts", "mfa_secret_sealed", 43))
+        print(f"moved to another row: {moved.error.kind} {moved.error.message}")
+        print(f"other column: {describe(ring.open(sealed, rowAad('tenant_sso', 'client_secret_sealed', 42)))}")
+        noAad: Result[str] = ring.open(sealed)
+        print(f"opened without aad: {noAad.error.kind} {noAad.error.message}")
+        plainV2: str = ring.seal("no-aad")?
+        withAad: Result[str] = ring.open(plainV2, aad)
+        print(f"v2 value with aad: {withAad.error.kind} {withAad.error.message}")
+        legacyRing: KeyRing = KeyRing.parse(K1)?
+        legacy: str = legacyRing.seal("legacy")?
+        print(f"legacy value with aad: {describe(ring.open(legacy, aad))}")
+
+        body: str = sealed[6:]
+        at: int = len(body) - 5
+        flipped: str = body[: at] + ("B" if body[at: at + 1] == "A" else "A") + body[at + 1:]
+        print(f"tampered ciphertext: {describe(ring.open('v3:k2:' + flipped, aad))}")
+        checkFlip: str = ("B" if body[: 1] == "A" else "A") + body[1:]
+        print(f"tampered check: {describe(ring.open('v3:k2:' + checkFlip, aad))}")
+        print(f"truncated v3: {describe(ring.open('v3:k2:' + body[:24], aad))}")
+
+        oldRing: KeyRing = ring.withPrimary("k1")?
+        oldSealed: str = oldRing.seal("old", aad)?
+        print(f"older key opens with aad: {oldSealed.startsWith('v3:k1:') and ring.open(oldSealed, aad)? == 'old'}")
+        k1only: KeyRing = KeyRing.parse(f"k1={K1}")?
+        print(f"unknown key with aad: {describe(k1only.open(sealed, aad))}")
+        print(f"inspect v3: {KeyRing.inspect(sealed)?}")
+
+        bound: str = ring.rebind(plainV2, "", rowAad("t", "c", 1))?
+        print(f"rebind v2 to row: {bound.startsWith('v3:k2:')} {ring.open(bound, 't.c:1')? == 'no-aad'}")
+        moved2: str = ring.rebind(bound, "t.c:1", "new-row")?
+        print(f"rebind row to row: {describe(ring.open(moved2, 't.c:1'))} {ring.open(moved2, 'new-row')?}")
+
+        binAad: str = "\x00\x01row\xff"
+        binSealed: str = ring.seal("b", binAad)?
+        otherBin: str = "\x00\x01row\xfe"
+        print(f"binary aad: {ring.open(binSealed, binAad)? == 'b'} {describe(ring.open(binSealed, otherBin))}")
+
+        k2only: KeyRing = KeyRing.parse(f"k2={K2}")?
+        print(f"python v3 fixture: {k2only.open(PY_V3, 'accounts.mfa_secret_sealed:42')?}")
+        print(f"python v3 fixture wrong row: {describe(k2only.open(PY_V3, 'accounts.mfa_secret_sealed:41'))}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

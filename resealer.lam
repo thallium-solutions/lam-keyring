@@ -1,0 +1,194 @@
+# @lam/keyring — re-encrypting stored values after a key rotation.
+#
+# A ``Resealer`` walks sealed values (a list, a list of ``SealedItem``s, or
+# pages fetched from a database) and re-encrypts every value that is not
+# sealed with the ring's primary key, counting what it did.
+
+from lamerrors import Result, Error
+from .keyring import KeyRing
+
+#- One stored sealed value: its row id, the value, and the associated data
+   it was sealed with. After processing, ``resealed`` holds the new value
+   when ``changed``; ``problem`` holds the error of a failed value. -#
+class SealedItem {
+    func init(self, id: str, sealed: str, aad: str = "") {
+        self.id: str = id
+        self.sealed: str = sealed
+        self.aad: str = aad
+        #- Associated data for the new value (``aad`` unless ``rebindTo``). -#
+        self.newAad: str = aad
+        self.resealed: str = sealed
+        self.changed: bool = False
+        self.problem: str = ""
+    }
+
+    #- Seal the value again with different associated data (e.g. bind
+       values that were sealed without it). -#
+    func rebindTo(self, aad: str) -> SealedItem {
+        self.newAad = aad
+        return self
+    }
+}
+
+#- Counts of a reseal run. For ``Resealer.values``/``items``, ``values``
+   lists the output values in input order (rotated or unchanged; failed
+   values are kept as they were); ``Resealer.run`` leaves it empty (the
+   ``store`` callback receives each new value). -#
+class ResealReport {
+    func init(self) {
+        self.scanned: int = 0
+        self.resealed: int = 0
+        self.unchanged: int = 0
+        self.failed: int = 0
+        #- Values whose ``store`` callback reported that the row changed
+           in the meantime (compare-and-swap lost); run again to finish. -#
+        self.conflicts: int = 0
+        self.batches: int = 0
+        self.errors: list[str] = []
+        self.values: list[str] = []
+    }
+
+    func ok(self) -> bool {
+        return self.failed == 0
+    }
+
+    #- Adds the counts of ``other`` (e.g. one report per table). -#
+    func add(self, other: ResealReport) {
+        self.scanned += other.scanned
+        self.resealed += other.resealed
+        self.unchanged += other.unchanged
+        self.failed += other.failed
+        self.conflicts += other.conflicts
+        self.batches += other.batches
+        for e in other.errors {
+            self.errors.append(e)
+        }
+    }
+
+    func __str__(self) -> str {
+        return f"ResealReport(scanned={self.scanned}, resealed={self.resealed}, unchanged={self.unchanged}, failed={self.failed}, conflicts={self.conflicts})"
+    }
+}
+
+#- Re-encrypts values with the primary key of ``ring``. ``dryRun`` counts
+   without producing new values or calling ``store``; ``stopOnError`` makes
+   the first undecryptable value fail the run instead of being counted. -#
+class Resealer {
+    func init(self, ring: KeyRing, dryRun: bool = False, stopOnError: bool = False) {
+        self.ring: KeyRing = ring
+        self.dryRun: bool = dryRun
+        self.stopOnError: bool = stopOnError
+    }
+
+    #- True when ``item`` would be rewritten. -#
+    func needsWork(self, item: SealedItem) -> bool {
+        if item.sealed == "" {
+            return False
+        }
+        return self.ring.needsReseal(item.sealed) or item.newAad != item.aad
+    }
+
+    #- Processes one item: sets ``resealed``/``changed`` and returns whether
+       it changed. An undecryptable value is an error (``problem`` is set). -#
+    func process(self, item: SealedItem) -> Result[bool] {
+        item.changed = False
+        item.resealed = item.sealed
+        item.problem = ""
+        if not self.needsWork(item) {
+            return Result.Ok(False)
+        }
+        plain: Result[str] = self.ring.open(item.sealed, item.aad)
+        if not plain.ok() {
+            item.problem = f"{plain.error.kind}: {plain.error.message}"
+            return Result.Err(Error(plain.error.kind, f"value {item.id}: {plain.error.message}"))
+        }
+        if not self.dryRun {
+            item.resealed = self.ring.seal(plain.unwrap(), item.newAad)?
+        }
+        item.changed = True
+        return Result.Ok(True)
+    }
+
+    #- Reseals plain values sharing one ``aad``; ids in errors are the
+       list indexes. -#
+    func values(self, values: list[str], aad: str = "") -> Result[ResealReport] {
+        items: list[SealedItem] = []
+        for i in range(len(values)) {
+            items.append(SealedItem(str(i), values[i], aad))
+        }
+        return self.items(items)
+    }
+
+    #- Reseals ``items`` in place (``item.resealed``). -#
+    func items(self, items: list[SealedItem]) -> Result[ResealReport] {
+        report: ResealReport = ResealReport()
+        report.batches = 1
+        for item in items {
+            _ = self._count(item, report)?
+            report.values.append(item.resealed)
+        }
+        return Result.Ok(report)
+    }
+
+    #- Pages through stored values: ``fetch(afterId, limit)`` returns up to
+       ``limit`` items with ``id > afterId`` ordered by id (``afterId`` is
+       ``""`` first); ``store(item)`` writes ``item.resealed`` (ideally only
+       where the value is still ``item.sealed``) and returns whether it
+       wrote. Errors from ``fetch``/``store`` stop the run. -#
+    func run(self, fetch: func(str, int) -> Result[list[SealedItem]], store: func(SealedItem) -> Result[bool], batchSize: int = 500) -> Result[ResealReport] {
+        if batchSize < 1 {
+            return Result.Err(Error("ValueError", "batchSize must be positive"))
+        }
+        report: ResealReport = ResealReport()
+        cursor: str = ""
+        while True {
+            page: list[SealedItem] = fetch(cursor, batchSize)?
+            if len(page) == 0 {
+                break
+            }
+            report.batches += 1
+            for item in page {
+                changed: bool = self._count(item, report)?
+                if changed and not self.dryRun {
+                    written: bool = store(item)?
+                    if not written {
+                        report.resealed -= 1
+                        report.conflicts += 1
+                    }
+                }
+            }
+            last: str = page[len(page) - 1].id
+            if last == cursor {
+                return Result.Err(Error("ValueError", f"fetch did not advance past id {cursor}; return items ordered by id, after the given id"))
+            }
+            cursor = last
+            if len(page) < batchSize {
+                break
+            }
+        }
+        return Result.Ok(report)
+    }
+
+    private func _count(self, item: SealedItem, report: ResealReport) -> Result[bool] {
+        report.scanned += 1
+        outcome: Result[bool] = self.process(item)
+        if not outcome.ok() {
+            if self.stopOnError {
+                return outcome
+            }
+            report.failed += 1
+            report.errors.append(f"{item.id}: {item.problem}")
+            return Result.Ok(False)
+        }
+        if outcome.unwrap() {
+            report.resealed += 1
+            return Result.Ok(True)
+        }
+        report.unchanged += 1
+        return Result.Ok(False)
+    }
+}
+
+func main() {
+    pass
+}

@@ -1,0 +1,26 @@
+# Prints the fixtures of tests/test_keyring_mft.lam with the managed-file-transfer
+# (MFT) SecretBox. Not part of the test run (it needs an MFT checkout):
+#
+#     lamc tests/interop/generate_mft_fixtures.lam \
+#         --extlibs ../managed-file-transfer/extlibs \
+#         --extlibs ../managed-file-transfer/lib --run
+#
+# Nonces are random, so every run prints different (equally valid) values.
+
+from mft.security import SecretBox
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+const NS: str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+func main() {
+    derived: str = SecretBox.keyFrom("a-long-application-secret-0123456789")
+    print(f"DERIVED={derived}")
+    print(f"DERIVED_EMPTY={SecretBox.keyFrom('')}")
+    print(f"LEGACY_K1={SecretBox.seal(K1, 'totp-secret').unwrap()}")
+    print(f"LEGACY_DERIVED={SecretBox.seal(derived, 'JBSWY3DPEHPK3PXP').unwrap()}")
+    print(f"V2_K2={SecretBox.seal(f'ring:k2={K2};legacy={K1}', 'sso-secret').unwrap()}")
+    print(f"V2_NS={SecretBox.seal(f'ring:k2={K2};legacy={derived}', NS).unwrap()}")
+    print(f"V2_EMPTY={SecretBox.seal(f'ring:k2={K2}', '').unwrap()}")
+    print(f"V2_UTF8={SecretBox.seal(f'ring:k2={K2}', 'pässwörd ✓').unwrap()}")
+}
