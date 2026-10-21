@@ -55,17 +55,6 @@ func ringKind(r: Result[KeyRing]) -> str {
     return r.error.kind
 }
 
-# try/catch lives in a helper: lamc 2.1.1 cannot compile a try/catch
-# inside a ``do { } catch`` block.
-func emptyPurpose(root: KeyRing) -> str {
-    try {
-        _ = root.forPurpose("")
-    } catch ValueError as _e {
-        return "ValueError"
-    }
-    return "none"
-}
-
 func main() {
     do {
         root: KeyRing = KeyRing.parse(f"k2={K2};k1={K1}")?
@@ -95,7 +84,13 @@ func main() {
         print(f"purpose merge mismatch: {ringKind(totp.merge(sso))}")
         rotatedRoot: KeyRing = (root.add("k3", K3)?).withPrimary("k3")?
         print(f"purpose of rotated ring opens: {rotatedRoot.forPurpose('totp').open(sealed)? == 'JBSWY3DPEHPK3PXP'}")
-        print(f"empty purpose: {emptyPurpose(root)}")
+        empty: str = "none"
+        try {
+            _ = root.forPurpose("")
+        } catch ValueError as _e {
+            empty = "ValueError"
+        }
+        print(f"empty purpose: {empty}")
 
         # Envelope encryption: the ring wraps per-tenant/per-file data keys.
         wrapped: str = root.wrapKey(NS_KEY)?

@@ -180,10 +180,7 @@ func main() {
 
         badSize: Result[ResealReport] = resealer.run(fetch, store, 0)
         print(f"run batch size: {badSize.error.kind} {badSize.error.message}")
-        # A typed local: a list literal inside Result.Ok in a lambda loses
-        # its element type with lamc 2.1.1.
-        stuckPage: list[SealedItem] = [SealedItem("", current)]
-        stuckFetch: func(str, int) -> Result[list[SealedItem]] = lambda(afterId: str, limit: int) -> Result[list[SealedItem]]: Result.Ok(stuckPage)
+        stuckFetch: func(str, int) -> Result[list[SealedItem]] = lambda(afterId: str, limit: int) -> Result[list[SealedItem]]: Result.Ok([SealedItem("", current)])
         stuck: Result[ResealReport] = resealer.run(stuckFetch, store, 1)
         print(f"run stuck fetch: {stuck.error.kind}")
         table.failFetch = True

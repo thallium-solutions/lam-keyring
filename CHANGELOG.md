@@ -2,6 +2,12 @@
 
 All notable changes to `@lam/keyring` are documented in this file.
 
+## [1.0.1] - 2026-10-21
+
+### Changed
+
+- Requires `lamc` 3.0 (`>=3.0, <4`); tests no longer work around lamc 2.1 limitations.
+
 ## [1.0.0] - 2026-10-19
 
 First release, extracted from the `SecretBox` of the managed-file-transfer

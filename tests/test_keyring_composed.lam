@@ -94,13 +94,11 @@ class Column {
     }
 }
 
-#- Every stored value of ``columns`` (lamc 2.1.1 has no list ``+``). -#
+#- Every stored value of ``columns``. -#
 func stored(columns: list[Column]) -> list[str] {
     out: list[str] = []
     for column in columns {
-        for id in column.order {
-            out.append(column.rows[id])
-        }
+        out = out + [column.rows[id] for id in column.order]
     }
     return out
 }

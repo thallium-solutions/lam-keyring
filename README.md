@@ -47,7 +47,7 @@ which existing applications already store.
 
 ## Requirements
 
-- `lamc` 2.1 or newer (`>=2.1, <4`).
+- `lamc` 3.0 or newer (`>=3.0, <4`).
 - A Go toolchain with `crypto/hkdf` and `crypto/pbkdf2` (Go 1.24 or newer).
 - No Go module dependencies.
 
@@ -57,13 +57,13 @@ Add the release to `lamlib.toml`:
 
 ```toml
 [dependencies]
-"@lam/keyring" = { git = "https://github.com/thallium-solutions/lam-keyring.git", ref = "1.0.0" }
+"@lam/keyring" = { git = "https://github.com/thallium-solutions/lam-keyring.git", ref = "1.0.1" }
 ```
 
 or install it directly:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-keyring.git@1.0.0
+lamc install https://github.com/thallium-solutions/lam-keyring.git@1.0.1
 lamc install ../lam-keyring          # a local checkout
 ```
 
@@ -511,7 +511,7 @@ python3 tests/run_lamkeyring_tests.py --verbose --mft ../managed-file-transfer  
 lamc fmt --check .
 ```
 
-The runner uses `lamc` from `PATH` (2.1 or newer), stages this checkout as
+The runner uses `lamc` from `PATH` (3.0 or newer), stages this checkout as
 `extlibs/@lam/keyring` in a temporary directory, compiles each
 `tests/test_*.lam` program without caches and compares its output with the
 `# expect:` lines. The suites cover RFC 5869 HKDF and PBKDF2-HMAC-SHA256
