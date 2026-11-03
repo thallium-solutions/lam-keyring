@@ -15,7 +15,7 @@ from pathlib import Path
 LIB_ROOT = Path(__file__).resolve().parents[1]
 COMPILER = "lamc"
 MIN_COMPILER_VERSION = (3, 0, 0)
-MAX_COMPILER_VERSION = (4, 0, 0)  # exclusive, matches lamlib.toml ">=3.0, <4"
+MAX_COMPILER_VERSION = (5, 0, 0)  # exclusive, matches lamlib.toml ">=3.0, <5"
 PACKAGE_PATH = Path("@lam") / "keyring"
 VERSION_PATTERN = re.compile(r"(?:lamc\s+)?v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?")
 

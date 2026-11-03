@@ -47,7 +47,7 @@ which existing applications already store.
 
 ## Requirements
 
-- `lamc` 3.0 or newer (`>=3.0, <4`).
+- `lamc` 3.0 or newer (`>=3.0, <5`).
 - A Go toolchain with `crypto/hkdf` and `crypto/pbkdf2` (Go 1.24 or newer).
 - No Go module dependencies.
 
