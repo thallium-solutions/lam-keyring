@@ -1,6 +1,6 @@
 [library]
 name = "@lam/keyring"
-version = "1.0.2"
+version = "1.0.3"
 description = "Sealing secrets at rest for Lammergeier: AES-256-GCM key rings with key ids, rotation, associated data, purpose subkeys and envelope keys"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]

@@ -57,13 +57,13 @@ Add the release to `lamlib.toml`:
 
 ```toml
 [dependencies]
-"@lam/keyring" = { git = "https://github.com/thallium-solutions/lam-keyring.git", ref = "1.0.1" }
+"@lam/keyring" = { git = "https://github.com/thallium-solutions/lam-keyring.git", ref = "1.0.3" }
 ```
 
 or install it directly:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-keyring.git@1.0.1
+lamc install https://github.com/thallium-solutions/lam-keyring.git@1.0.3
 lamc install ../lam-keyring          # a local checkout
 ```
 
@@ -243,7 +243,7 @@ purpose rings) and `str(ring)`, which never shows key material.
 Static helpers returning lowercase hex: `hkdf(secret, salt, info, length=32)`,
 `hkdfHex(secretHex, saltHex, infoHex, length=32)`, `pbkdf2(password, saltHex,
 iterations, length=32)` (all `Result[str]`), `legacyHmac(secret, label)` and
-`randomHex(size=16)` (`str`).
+`randomHex(size=16)` (`str`; `""` for a size of 0 or less).
 
 ### `Resealer`, `SealedItem`, `ResealReport`
 

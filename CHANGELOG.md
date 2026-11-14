@@ -2,6 +2,28 @@
 
 All notable changes to `@lam/keyring` are documented in this file.
 
+## [1.0.3] - 2026-11-14
+
+### Fixed
+
+- `KeyDerivation.randomHex(size)` with a negative size returns `""`; it
+  panicked (`makeslice: len out of range`).
+
+### Tests
+
+- `tests/test_keyring_bytes_concurrency.lam`: every byte value and a 1 MiB
+  value round-trip byte-exact; associated data compared as bytes (precomposed
+  and decomposed `é`), long and separator-laden associated data, an empty aad
+  is no aad; non-ASCII and invalid key ids; `randomHex`, HKDF and PBKDF2
+  bounds; `constantTimeEquals` on non-ASCII and empty strings; 64 async tasks
+  sealing and opening rows with a ring and its purpose subring, four
+  concurrent `Resealer`s after a rotation, and a `?`/`do/catch` pipeline over
+  the result.
+- `tests/test_keyring_composed.lam` counts legacy values by the absence of a
+  `v2:`/`v3:` prefix. It counted values not starting with `v`, but a legacy
+  value is bare base64 of a random nonce and starts with `v` 1 time in 64, so
+  the test failed about 1 run in 20 (`legacy=2`).
+
 ## [1.0.2] - 2026-11-03
 
 ### Changed

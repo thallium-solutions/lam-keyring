@@ -135,7 +135,9 @@ func main() {
         for i, secret in enumerate(secrets, 1) {
             accounts.put(str(i), legacyMode.seal(secret)?)
         }
-        legacyCount: int = len([f for f in accounts.formats() if not f.startsWith("v")])
+        # A legacy value is bare base64, which may itself start with "v": only
+        # a "vN:" prefix marks a versioned value (base64 has no ":").
+        legacyCount: int = len([f for f in accounts.formats() if not (f.startsWith("v2:") or f.startsWith("v3:"))])
         print(f"phase 1: {legacyMode} legacy={legacyCount}")
 
         # Phase 2: DATA_ENCRYPTION_KEYS-style configuration; bind account

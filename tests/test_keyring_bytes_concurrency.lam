@@ -1,0 +1,180 @@
+# Test: @lam/keyring byte-exact values, associated-data edge cases,
+# derivation bounds, and a ring shared by concurrent tasks.
+#
+#   * Every byte value 0..255 (not valid UTF-8) round-trips byte-exact; a
+#     1 MiB value too; sealed values are ASCII.
+#   * Associated data is compared as bytes: a precomposed and a decomposed
+#     "é" differ, a 10 000-character aad and one with ':' and ';' work, an
+#     empty aad is "no aad".
+#   * Key ids: non-ASCII ids are allowed, ids with separators or spaces are
+#     not; `inspect` reads a non-ASCII id back.
+#   * Bounds: `randomHex(0)` is empty and a negative size returns "" instead
+#     of panicking (1.0.3 fix); hkdf lengths 1 and 8160 (255 x 32) work and
+#     8161 does not; pbkdf2 refuses a length of 0 and a non-hex salt.
+#   * `constantTimeEquals` on non-ASCII and empty strings.
+#   * Concurrency: 64 async tasks seal and open rows with one ring (and its
+#     purpose subring); every value opens only with its own row; four
+#     `Resealer`s run concurrently over separate tables after a rotation,
+#     then a `do/catch` pipeline with `?` checks the result.
+#
+# expect: all bytes: 256 true ascii=true
+# expect: one MiB: true
+# expect: aad as bytes: ok WrongAssociatedData
+# expect: long aad: ok separators: ok WrongAssociatedData
+# expect: empty aad is no aad: v2 true
+# expect: ids: clé=true has-colon=InvalidKey has-space=InvalidKey inspect=clé
+# expect: randomHex: 0 0 64
+# expect: hkdf lengths: 2 16320 InvalidKey
+# expect: pbkdf2: InvalidKey InvalidKey
+# expect: constant time: true false true false
+# expect: concurrent seals: 64 distinct=64 opened=64 cross-row=WrongAssociatedData
+# expect: concurrent purpose seals: 64 root-ring=Corrupted
+# expect: concurrent resealers: scanned=40 resealed=40 failed=0 all-k2=true
+# expect: pipeline: ok 40 rows
+# expect: pipeline: old table refused: Stale
+# expect: ok
+
+from @lam/keyring import KeyRing, KeyDerivation, Resealer, ResealReport, SealedInfo
+from lamerrors import Result, Error
+
+const K1: str = "1111111111111111111111111111111111111111111111111111111111111111"
+const K2: str = "2222222222222222222222222222222222222222222222222222222222222222"
+
+go! {
+    func allBytes() string {
+        raw := make([]byte, 256)
+        for i := range raw {
+            raw[i] = byte(i)
+        }
+        return string(raw)
+    }
+}
+
+func kind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func isAscii(text: str) -> bool {
+    return len(bytes(text)) == len(text)
+}
+
+async func sealRow(ring: KeyRing, row: int) -> Result[str] {
+    return ring.seal(f"secret-{row}-ünïcødé", f"accounts.secret:{row}")
+}
+
+async func openRow(ring: KeyRing, sealed: str, row: int) -> Result[str] {
+    return ring.open(sealed, f"accounts.secret:{row}")
+}
+
+async func resealTable(ring: KeyRing, values: list[str]) -> Result[ResealReport] {
+    return Resealer(ring).values(values)
+}
+
+func verifyTable(ring: KeyRing, values: list[str]) -> Result[int] {
+    opened: int = 0
+    for value in values {
+        info: SealedInfo = KeyRing.inspect(value)?
+        if info.keyId != ring.primaryId() {
+            return Result.Err(Error("Stale", f"value still sealed with {info.keyId}"))
+        }
+        _ = ring.open(value)?
+        opened++
+    }
+    return Result.Ok(opened)
+}
+
+func main() {
+    ring: KeyRing = KeyRing.parse(f"k1={K1}").unwrap()
+
+    # ── Byte-exact values ───────────────────────────────────────
+    raw: str = ""
+    go! {
+        raw = allBytes()
+    }
+    sealedRaw: str = ring.seal(raw).unwrap()
+    back: str = ring.open(sealedRaw).unwrap()
+    print(f"all bytes: {len(bytes(back))} {back == raw} ascii={isAscii(sealedRaw)}")
+    mib: str = "λ" * 524288
+    print(f"one MiB: {ring.open(ring.seal(mib).unwrap()).unwrap() == mib}")
+
+    # ── Associated data ─────────────────────────────────────────
+    composed: str = "row:é"
+    decomposed: str = "row:é"
+    bound: str = ring.seal("v", composed).unwrap()
+    print(f"aad as bytes: {kind(ring.open(bound, composed))} {kind(ring.open(bound, decomposed))}")
+    longAad: str = "t" * 10000
+    separators: str = "tenant:7;table=a,b:c"
+    print(f"long aad: {kind(ring.open(ring.seal('v', longAad).unwrap(), longAad))} separators: {kind(ring.open(ring.seal('v', separators).unwrap(), separators))} {kind(ring.open(ring.seal('v', separators).unwrap(), 'tenant:7'))}")
+    noAad: str = ring.seal("v", "").unwrap()
+    print(f"empty aad is no aad: {KeyRing.inspect(noAad).unwrap().version} {ring.open(noAad).ok()}")
+
+    # ── Key ids ─────────────────────────────────────────────────
+    accented: Result[KeyRing] = KeyRing.single("clé", K2)
+    colon: Result[KeyRing] = KeyRing.single("a:b", K2)
+    space: Result[KeyRing] = KeyRing.single("a b", K2)
+    inspected: str = KeyRing.inspect(accented.unwrap().seal("x").unwrap()).unwrap().keyId
+    print(f"ids: clé={accented.ok()} has-colon={kind(colon)} has-space={kind(space)} inspect={inspected}")
+
+    # ── Bounds ──────────────────────────────────────────────────
+    print(f"randomHex: {len(KeyDerivation.randomHex(0))} {len(KeyDerivation.randomHex(-4))} {len(KeyDerivation.randomHex(32))}")
+    print(f"hkdf lengths: {len(KeyDerivation.hkdf('secret', 'salt', 'info', 1).unwrap())} {len(KeyDerivation.hkdf('secret', 'salt', 'info', 8160).unwrap())} {kind(KeyDerivation.hkdf('secret', 'salt', 'info', 8161))}")
+    print(f"pbkdf2: {kind(KeyDerivation.pbkdf2('pw', '00112233445566778899aabbccddeeff', 1, 0))} {kind(KeyDerivation.pbkdf2('pw', 'not hex', 1))}")
+    print(f"constant time: {KeyRing.constantTimeEquals('çà🦅', 'çà🦅')} {KeyRing.constantTimeEquals('çà🦅', 'ça🦅')} {KeyRing.constantTimeEquals('', '')} {KeyRing.constantTimeEquals('', ' ')}")
+
+    # ── Concurrency ─────────────────────────────────────────────
+    seals = [sealRow(ring, row) for row in range(64)]
+    sealed: list[str] = []
+    for task in seals {
+        # WORKAROUND (lamc 4.14.0 bug, /tmp/lam-pkg-compiler-bugs/
+        # await_result_unwrap.lam): `(await task).unwrap()` loses the payload
+        # type; bind the awaited Result first.
+        done: Result[str] = await task
+        sealed.append(done.unwrap())
+    }
+    opens = [openRow(ring, sealed[row], row) for row in range(64)]
+    opened: int = 0
+    for row, task in enumerate(opens) {
+        r: Result[str] = await task
+        if r.ok() and r.unwrap() == f"secret-{row}-ünïcødé" {
+            opened++
+        }
+    }
+    print(f"concurrent seals: {len(sealed)} distinct={len(set(sealed))} opened={opened} cross-row={kind(ring.open(sealed[0], 'accounts.secret:1'))}")
+
+    totp: KeyRing = ring.forPurpose("totp")
+    purposeSeals = [sealRow(totp, row) for row in range(64)]
+    purposeSealed: list[str] = []
+    for task in purposeSeals {
+        done: Result[str] = await task  # WORKAROUND, as above
+        purposeSealed.append(done.unwrap())
+    }
+    print(f"concurrent purpose seals: {len([v for i, v in enumerate(purposeSealed) if totp.open(v, f'accounts.secret:{i}').ok()])} root-ring={kind(ring.open(purposeSealed[0], 'accounts.secret:0'))}")
+
+    tables: list[list[str]] = [[ring.seal(f"t{t}-r{r}").unwrap() for r in range(10)] for t in range(4)]
+    rotated: KeyRing = ring.add("k2", K2).unwrap().withPrimary("k2").unwrap()
+    reseals = [resealTable(rotated, table) for table in tables]
+    total: ResealReport = ResealReport()
+    outputs: list[str] = []
+    for task in reseals {
+        done: Result[ResealReport] = await task  # WORKAROUND, as above
+        report: ResealReport = done.unwrap()
+        total.add(report)
+        outputs.extend(report.values)
+    }
+    allK2: bool = outputs.all(lambda v: KeyRing.inspect(v).unwrap().keyId == "k2")
+    print(f"concurrent resealers: scanned={total.scanned} resealed={total.resealed} failed={total.failed} all-k2={allK2}")
+
+    do {
+        retired: KeyRing = rotated.without("k1")?
+        rows: int = verifyTable(retired, outputs)?
+        print(f"pipeline: ok {rows} rows")
+        _ = verifyTable(retired, tables[0])?
+        print("pipeline: stale values accepted")
+    } catch err {
+        print(f"pipeline: old table refused: {err.kind}")
+    }
+    print("ok")
+}

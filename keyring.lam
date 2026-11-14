@@ -275,9 +275,13 @@ class KeyDerivation {
         return Result.Ok(out)
     }
 
-    #- ``size`` random bytes (crypto/rand) as hex. -#
+    #- ``size`` random bytes (crypto/rand) as hex; ``""`` for a size of 0
+       or less. -#
     static func randomHex(size: int = 16) -> str {
         out: str = ""
+        if size <= 0 {
+            return out
+        }
         go! {
             buf := make([]byte, size)
             if _, err := cryptorand.Read(buf); err != nil {
